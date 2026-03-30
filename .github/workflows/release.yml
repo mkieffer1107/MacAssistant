@@ -1,0 +1,46 @@
+name: Release macOS App
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and publish release
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Build release artifacts
+        id: build
+        run: |
+          set -euo pipefail
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -z "$VERSION" ]; then
+            echo "Could not derive version from tag: ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+
+          chmod +x ./build.sh
+          ./build.sh "$VERSION" --local
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ steps.build.outputs.version }}/MacAssistant-${{ steps.build.outputs.version }}.dmg
+            dist/${{ steps.build.outputs.version }}/MacAssistant-${{ steps.build.outputs.version }}.zip
+            dist/${{ steps.build.outputs.version }}/SHA256SUMS.txt
