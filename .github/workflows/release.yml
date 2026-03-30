@@ -13,7 +13,7 @@ permissions:
 jobs:
   build-and-release:
     name: Build and publish release
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -64,6 +64,14 @@ jobs:
       - name: Verify Xcode compatibility
         run: |
           set -euo pipefail
+
+          macos_version="$(sw_vers -productVersion)"
+          major="${macos_version%%.*}"
+          if [ "$major" -lt 26 ]; then
+            echo "macOS ${macos_version} is not supported for this workflow. Release builds require macOS 26+."
+            exit 1
+          fi
+
           xcode_version="$(xcodebuild -version | awk 'NR==1 { print $2 }')"
           major="${xcode_version%%.*}"
           if [ "$major" -lt 16 ]; then
