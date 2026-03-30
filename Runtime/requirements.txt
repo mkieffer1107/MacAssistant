@@ -1,0 +1,9 @@
+huggingface-hub>=0.31.0
+mcp>=1.10.0
+mistral-common[audio,image]>=1.10.0
+mlx-audio[tts,stt] @ git+https://github.com/Blaizzy/mlx-audio.git@6408d2a410eb8c57464e07725b92271860199250
+mlx-lm>=0.25.2
+mlx-vlm>=0.4.2
+numpy>=2.0.0
+torch>=2.11.0
+torchvision>=0.26.0

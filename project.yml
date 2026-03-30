@@ -1,0 +1,72 @@
+name: MacAssistant
+options:
+  createIntermediateGroups: true
+  defaultConfig: Debug
+settings:
+  base:
+    SWIFT_VERSION: 6.0
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  MacAssistant:
+    type: application
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: MacAssistant
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.mkieffer.MacAssistant
+        PRODUCT_NAME: MacAssistant
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleShortVersionString: $(MARKETING_VERSION)
+        INFOPLIST_KEY_CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        INFOPLIST_KEY_CFBundleDisplayName: MacAssistant
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: MacAssistant uses the microphone to capture voice requests.
+        INFOPLIST_KEY_NSAppleEventsUsageDescription: MacAssistant uses Apple Events to automate apps on your Mac through approved tool calls.
+        ENABLE_APP_SANDBOX: NO
+      configs:
+        Release:
+          ENABLE_HARDENED_RUNTIME: YES
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+    postBuildScripts:
+      - name: Copy Runtime Resources
+        inputFiles:
+          - $(PROJECT_DIR)/Runtime/AgentRuntimeHost.sh
+          - $(PROJECT_DIR)/Runtime/agent_runtime_host.py
+          - $(PROJECT_DIR)/Runtime/requirements.txt
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/AgentRuntimeHost.sh
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/agent_runtime_host.py
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/requirements.txt
+        script: |
+          set -euo pipefail
+          mkdir -p "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
+          cp "$PROJECT_DIR/Runtime/AgentRuntimeHost.sh" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/AgentRuntimeHost.sh"
+          cp "$PROJECT_DIR/Runtime/agent_runtime_host.py" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/agent_runtime_host.py"
+          cp "$PROJECT_DIR/Runtime/requirements.txt" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/requirements.txt"
+  MacAssistantTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: MacAssistantTests
+    dependencies:
+      - target: MacAssistant
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.mkieffer.MacAssistantTests
+        INFOPLIST_KEY_CFBundleShortVersionString: $(MARKETING_VERSION)
+        INFOPLIST_KEY_CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+schemes:
+  MacAssistant:
+    build:
+      targets:
+        MacAssistant: all
+        MacAssistantTests: [test]
+    test:
+      targets:
+        - name: MacAssistantTests
