@@ -2,8 +2,10 @@ name: Release macOS App
 
 on:
   push:
+    branches:
+      - "**"
     tags:
-      - "v*"
+      - "*"
 
 permissions:
   contents: write
@@ -26,20 +28,47 @@ jobs:
         run: |
           set -euo pipefail
 
-          VERSION="${GITHUB_REF_NAME#v}"
-          if [ -z "$VERSION" ]; then
-            echo "Could not derive version from tag: ${GITHUB_REF_NAME}" >&2
-            exit 1
+          IS_TAG="false"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            IS_TAG="true"
+          fi
+
+          if [ "$IS_TAG" = "true" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            if [ -z "$VERSION" ]; then
+              echo "Could not derive version from tag: ${GITHUB_REF_NAME}" >&2
+              exit 1
+            fi
+            RELEASE_TAG="${GITHUB_REF_NAME}"
+            RELEASE_NAME="Release ${GITHUB_REF_NAME}"
+            PRERELEASE="false"
+            MAKE_LATEST="true"
+          else
+            VERSION="${GITHUB_SHA::7}"
+            RELEASE_TAG="nightly-${GITHUB_RUN_NUMBER}-${VERSION}"
+            RELEASE_NAME="Nightly ${VERSION} (${GITHUB_RUN_NUMBER})"
+            PRERELEASE="true"
+            MAKE_LATEST="false"
           fi
 
           chmod +x ./build.sh
           ./build.sh "$VERSION" --local
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "make_latest=$MAKE_LATEST" >> "$GITHUB_OUTPUT"
+          echo "release_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.build.outputs.release_tag }}
+          name: ${{ steps.build.outputs.release_name }}
+          prerelease: ${{ steps.build.outputs.prerelease }}
+          make_latest: ${{ steps.build.outputs.make_latest }}
+          target_commitish: ${{ steps.build.outputs.release_sha }}
           files: |
             dist/${{ steps.build.outputs.version }}/MacAssistant-${{ steps.build.outputs.version }}.dmg
             dist/${{ steps.build.outputs.version }}/MacAssistant-${{ steps.build.outputs.version }}.zip
