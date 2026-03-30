@@ -1020,11 +1020,14 @@ private struct ExpandedMessageImageView: View {
                 }
 
             Group {
-                if let image = NSImage(contentsOf: attachment.fileURL) {
-                    Image(nsImage: image)
-                        .resizable()
-                        .scaledToFit()
-                } else {
+                CachedAttachmentImage(
+                    request: AttachmentImageRequest(
+                        url: attachment.fileURL,
+                        maxPixelSize: 1_840
+                    ),
+                    contentMode: .fit,
+                    imagePadding: 0
+                ) {
                     RoundedRectangle(cornerRadius: 24, style: .continuous)
                         .fill(AppTheme.badgeFill)
                         .overlay {
@@ -1069,21 +1072,14 @@ private struct AttachmentThumbnail: View {
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .fill(AppTheme.badgeFill)
 
-            if let image = NSImage(contentsOf: url) {
-                Group {
-                    if contentMode == .fill {
-                        Image(nsImage: image)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    } else {
-                        Image(nsImage: image)
-                            .resizable()
-                            .scaledToFit()
-                            .padding(18)
-                    }
-                }
-            } else {
+            CachedAttachmentImage(
+                request: AttachmentImageRequest(
+                    url: url,
+                    maxPixelSize: max(Int(size * 2), 1)
+                ),
+                contentMode: contentMode,
+                imagePadding: contentMode == .fit ? 18 : 0
+            ) {
                 Image(systemName: "photo")
                     .font(.system(size: 20, weight: .medium))
                     .foregroundStyle(AppTheme.secondaryText)
@@ -1105,8 +1101,8 @@ private struct BubbleText: View {
 
     var body: some View {
         Group {
-            if rendersMarkdown, let markdown = parsedMarkdown {
-                Text(markdown)
+            if rendersMarkdown {
+                CachedMarkdownText(text: text)
             } else {
                 Text(text)
             }
@@ -1116,16 +1112,6 @@ private struct BubbleText: View {
         .textSelection(.enabled)
         .multilineTextAlignment(textAlignment)
         .tint(AppTheme.accent)
-    }
-
-    private var parsedMarkdown: AttributedString? {
-        try? AttributedString(
-            markdown: text,
-            options: AttributedString.MarkdownParsingOptions(
-                interpretedSyntax: .full,
-                failurePolicy: .returnPartiallyParsedIfPossible
-            )
-        )
     }
 }
 
@@ -1177,7 +1163,7 @@ private struct ToolCardView: View {
 
             if tool.isExpanded {
                 VStack(alignment: .leading, spacing: 10) {
-                    InfoBlock(title: "Arguments", content: pretty(tool.arguments))
+                    InfoBlock(title: "Arguments", content: tool.prettyArguments)
 
                     if !tool.output.isEmpty {
                         InfoBlock(title: "Result", content: tool.output)
@@ -1279,13 +1265,6 @@ private struct ToolCardView: View {
         }
     }
 
-    private func pretty(_ arguments: [String: JSONValue]) -> String {
-        guard let data = try? JSONEncoder().encode(arguments),
-              let string = String(data: data, encoding: .utf8) else {
-            return "{}"
-        }
-        return string
-    }
 }
 
 private struct InfoBlock: View {

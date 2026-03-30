@@ -49,6 +49,7 @@ final class AgentRuntimeClient: RuntimeClienting {
         isStopping = false
         runtimeOutputSessionID = UUID()
         outputPump.reset()
+        launchLogWriter.trimToLimitIfNeeded()
 
         let scriptName = "AgentRuntimeHost.sh"
         guard let scriptURL = Bundle.main.url(forResource: "AgentRuntimeHost", withExtension: "sh") else {
@@ -282,12 +283,60 @@ private enum RuntimeProcessedOutput: Sendable {
     case error(String)
 }
 
+enum RuntimeLaunchLogTrimmer {
+    static let defaultMaxRetainedBytes = 8 * 1_024 * 1_024
+
+    static func trimFileIfNeeded(
+        at logURL: URL,
+        maxRetainedBytes: Int = defaultMaxRetainedBytes,
+        fileManager: FileManager = .default
+    ) {
+        guard maxRetainedBytes > 0 else { return }
+        guard let attributes = try? fileManager.attributesOfItem(atPath: logURL.path),
+              let fileSizeNumber = attributes[.size] as? NSNumber else {
+            return
+        }
+
+        let fileSize = fileSizeNumber.intValue
+        guard fileSize > maxRetainedBytes else { return }
+
+        guard let handle = try? FileHandle(forReadingFrom: logURL) else { return }
+        defer { try? handle.close() }
+
+        let startOffset = max(0, fileSize - maxRetainedBytes)
+        try? handle.seek(toOffset: UInt64(startOffset))
+        guard let tailData = try? handle.readToEnd() else { return }
+        var trimmedData = tailData
+
+        if startOffset > 0, let newlineIndex = trimmedData.firstIndex(of: 0x0A) {
+            trimmedData.removeSubrange(...newlineIndex)
+        }
+
+        if trimmedData.count > maxRetainedBytes {
+            var tailSlice = Data(trimmedData.suffix(maxRetainedBytes))
+            if let newlineIndex = tailSlice.firstIndex(of: 0x0A) {
+                tailSlice.removeSubrange(...newlineIndex)
+            }
+            trimmedData = tailSlice
+        }
+
+        try? trimmedData.write(to: logURL, options: .atomic)
+    }
+}
+
 private final class RuntimeLaunchLogWriter: @unchecked Sendable {
     private let logURL: URL
     private let queue = DispatchQueue(label: "MacAssistant.RuntimeLaunchLogWriter", qos: .utility)
 
     init(logURL: URL) {
         self.logURL = logURL
+    }
+
+    func trimToLimitIfNeeded() {
+        let logURL = self.logURL
+        queue.async {
+            RuntimeLaunchLogTrimmer.trimFileIfNeeded(at: logURL)
+        }
     }
 
     func write(_ message: String) {
@@ -306,6 +355,7 @@ private final class RuntimeLaunchLogWriter: @unchecked Sendable {
             } else {
                 try? data.write(to: logURL)
             }
+            RuntimeLaunchLogTrimmer.trimFileIfNeeded(at: logURL)
         }
     }
 }

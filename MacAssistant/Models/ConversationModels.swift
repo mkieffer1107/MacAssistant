@@ -72,6 +72,7 @@ struct ToolInvocation: Identifiable, Equatable, Sendable {
     let toolCallID: String
     var name: String
     var arguments: [String: JSONValue]
+    var prettyArguments: String = "{}"
     var safetyClass: SafetyClass
     var approvalState: ApprovalState
     var executionState: ExecutionState

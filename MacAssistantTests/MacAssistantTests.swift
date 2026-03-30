@@ -1031,6 +1031,228 @@ struct MacAssistantTests {
 
     @Test
     @MainActor
+    func settingsGeneralSnapshotReflectsCurrentSelectionsAndDevices() {
+        let builtInMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 1,
+            uid: "built-in-mic",
+            name: "MacBook Microphone",
+            transport: .builtIn
+        )
+        let airPodsMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 2,
+            uid: "airpods-mic",
+            name: "AirPods Pro",
+            transport: .bluetooth
+        )
+        let microphoneService = FakeMicrophoneCaptureService()
+        microphoneService.inputDevices = [builtInMicrophone, airPodsMicrophone]
+        microphoneService.defaultInputDeviceUID = builtInMicrophone.uid
+
+        let model = AppModel(
+            runtime: FakeRuntimeClient(),
+            microphoneService: microphoneService
+        )
+        model.settings.defaultVoicePreset = "neutral_female"
+        model.settings.inputDevicePreference = .specificDeviceUID("missing-mic")
+        model.settings.launchOnOpen = true
+        model.settings.alwaysAcceptToolCalls = true
+        model.settings.streamReplySpeechWhileGenerating = false
+
+        let snapshot = model.settingsGeneralSnapshot
+
+        #expect(snapshot.defaultVoicePreset == "neutral_female")
+        #expect(snapshot.selectedInputDevicePickerValue == "missing-mic")
+        #expect(snapshot.launchOnOpen)
+        #expect(snapshot.alwaysAcceptToolCalls)
+        #expect(snapshot.streamReplySpeechWhileGenerating == false)
+        #expect(snapshot.availableInputDevices.map(\.uid) == [builtInMicrophone.uid, airPodsMicrophone.uid])
+        #expect(snapshot.unavailableSelectedInputDeviceUID == "missing-mic")
+    }
+
+    @Test
+    @MainActor
+    func settingsModelFilesSnapshotPreservesStableIDsAndMapsState() {
+        let model = AppModel(runtime: FakeRuntimeClient())
+
+        model.handle(event: runtimeEvent(
+            type: "model_state",
+            modelID: RuntimeModelID.agentModel.rawValue,
+            installState: ModelInstallState.installed.rawValue,
+            warmState: WarmState.warm.rawValue
+        ))
+        model.handle(event: runtimeEvent(
+            type: "model_state",
+            modelID: RuntimeModelID.ttsModel.rawValue,
+            installState: ModelInstallState.downloading.rawValue,
+            warmState: WarmState.cold.rawValue
+        ))
+        model.handle(event: runtimeEvent(
+            type: "model_state",
+            modelID: RuntimeModelID.sttModel.rawValue,
+            installState: ModelInstallState.downloading.rawValue,
+            warmState: WarmState.cold.rawValue
+        ))
+        model.handle(event: runtimeEvent(
+            type: "download_progress",
+            modelID: RuntimeModelID.ttsModel.rawValue,
+            installableID: "voice_pack",
+            bytesDownloaded: 512,
+            bytesTotal: 1024,
+            etaSeconds: 4.0,
+            speedBytesPerSecond: 128
+        ))
+
+        let snapshot = model.settingsModelFilesSnapshot
+        let agentEntry = snapshot.entries.first(where: { $0.id == RuntimeModelID.agentModel.rawValue })
+        let ttsEntry = snapshot.entries.first(where: { $0.id == RuntimeModelID.ttsModel.rawValue })
+
+        #expect(snapshot.entries.map(\.id) == RuntimeModelID.allCases.map(\.rawValue))
+        #expect(agentEntry?.action == .deleteModel(.agentModel))
+        #expect(agentEntry?.actionTitle == "Delete")
+        #expect(agentEntry?.warmState == .warm)
+        #expect(ttsEntry?.installState == .downloading)
+        #expect(ttsEntry?.action == nil)
+        #expect(ttsEntry?.progress?.bytesDownloaded == 512)
+    }
+
+    @Test
+    @MainActor
+    func settingsModelFileActionDispatchesInstallRequests() {
+        let runtime = FakeRuntimeClient()
+        let model = AppModel(runtime: runtime)
+
+        model.handleSettingsModelFileAction(.installInstallable("agent_model"))
+
+        #expect(runtime.sentCommands.last?.type == "download_model")
+        #expect(runtime.sentCommands.last?.installableID == "agent_model")
+        #expect(model.underlyingModels[RuntimeModelID.agentModel.rawValue]?.installState == .downloading)
+    }
+
+    @Test
+    @MainActor
+    func settingsRuntimeLogsSnapshotMatchesRetainedBuffer() {
+        let runtime = FakeRuntimeClient()
+        let model = AppModel(runtime: runtime)
+
+        for index in 0..<12 {
+            runtime.onLog?("settings-log-\(index)")
+        }
+
+        let snapshot = model.settingsRuntimeLogsSnapshot
+
+        #expect(snapshot.entries == model.runtimeLogEntries)
+        #expect(snapshot.lineCount == model.runtimeLogLineCount)
+        #expect(snapshot.byteCount == model.runtimeLogByteCount)
+        #expect(snapshot.entries.last?.text == "settings-log-11")
+    }
+
+    @Test
+    @MainActor
+    func runtimeLogsRetainNewestEntriesWithinLineCap() {
+        let runtime = FakeRuntimeClient()
+        let model = AppModel(runtime: runtime)
+
+        for index in 0..<1_200 {
+            runtime.onLog?("log-\(index)-" + String(repeating: "x", count: 32))
+        }
+
+        #expect(model.runtimeLogLineCount == 1_000)
+        #expect(model.runtimeLogEntries.count == 1_000)
+        #expect(model.runtimeLogEntries.first?.text.contains("log-200-") == true)
+        #expect(model.runtimeLogEntries.last?.text.contains("log-1199-") == true)
+        #expect(model.runtimeLogsText.contains("log-1199-"))
+        #expect(!model.runtimeLogsText.contains("log-199-"))
+        #expect(model.runtimeLogsText == model.runtimeLogEntries.map(\.text).joined(separator: "\n"))
+    }
+
+    @Test
+    @MainActor
+    func runtimeLogsTrimToByteLimitAndPreserveNewestEntries() {
+        let runtime = FakeRuntimeClient()
+        let model = AppModel(runtime: runtime)
+        let oversizedPayload = String(repeating: "z", count: 12_000)
+
+        for index in 0..<140 {
+            runtime.onLog?("byte-log-\(index)-\(oversizedPayload)")
+        }
+
+        #expect(model.runtimeLogByteCount <= 1_048_576)
+        #expect(model.runtimeLogEntries.last?.text.contains("byte-log-139-") == true)
+        #expect(model.runtimeLogsText.contains("byte-log-139-"))
+    }
+
+    @Test
+    @MainActor
+    func startPrunesOnlyStaleLegacyAudioCacheFiles() throws {
+        let runtime = FakeRuntimeClient()
+        let appSupportURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let cacheURL = appSupportURL.appendingPathComponent("cache", isDirectory: true)
+
+        try FileManager.default.createDirectory(at: cacheURL, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: appSupportURL)
+        }
+
+        let staleWAV = cacheURL.appendingPathComponent("stale.wav")
+        let recentWAV = cacheURL.appendingPathComponent("recent.wav")
+        let untouchedText = cacheURL.appendingPathComponent("note.txt")
+
+        try Data("stale".utf8).write(to: staleWAV)
+        try Data("recent".utf8).write(to: recentWAV)
+        try Data("note".utf8).write(to: untouchedText)
+
+        let staleDate = Date(timeIntervalSinceNow: -(8 * 24 * 60 * 60))
+        let recentDate = Date()
+        try FileManager.default.setAttributes([.modificationDate: staleDate], ofItemAtPath: staleWAV.path)
+        try FileManager.default.setAttributes([.modificationDate: recentDate], ofItemAtPath: recentWAV.path)
+
+        let model = AppModel(
+            appSupportURL: appSupportURL,
+            persistSettings: false,
+            runtime: runtime
+        )
+        model.start()
+
+        #expect(!FileManager.default.fileExists(atPath: staleWAV.path))
+        #expect(FileManager.default.fileExists(atPath: recentWAV.path))
+        #expect(FileManager.default.fileExists(atPath: untouchedText.path))
+        #expect(model.runtimeLogsText.contains("[Maintenance] Removed 1 stale cached audio file"))
+    }
+
+    @Test
+    func runtimeLaunchLogTrimmerRetainsNewestCompleteLinesWithinLimit() throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let logURL = tempDirectory.appendingPathComponent("runtime-launch.log")
+        try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: tempDirectory)
+        }
+
+        let content = (0..<40)
+            .map { "entry-\($0)-" + String(repeating: "q", count: 18) }
+            .joined(separator: "\n")
+            + "\n"
+        let logData = try #require(content.data(using: .utf8))
+        try logData.write(to: logURL)
+
+        RuntimeLaunchLogTrimmer.trimFileIfNeeded(at: logURL, maxRetainedBytes: 160)
+
+        let trimmedContent = try String(contentsOf: logURL, encoding: .utf8)
+        let firstLine = try #require(trimmedContent.split(separator: "\n").first.map(String.init))
+        let fileSize = try #require(
+            (try FileManager.default.attributesOfItem(atPath: logURL.path)[.size] as? NSNumber)?.intValue
+        )
+
+        #expect(firstLine.hasPrefix("entry-"))
+        #expect(trimmedContent.contains("entry-39-"))
+        #expect(!trimmedContent.contains("entry-0-"))
+        #expect(fileSize <= 160)
+    }
+
+    @Test
+    @MainActor
     func resetConversationClearsChatAndIgnoresLateTurnUpdates() {
         let model = AppModel()
 

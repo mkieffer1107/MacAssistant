@@ -15,13 +15,18 @@
 		3744374066B2222EB56EFC87 /* MicrophoneRouteCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A77E051E514F7DA5879DFFA6 /* MicrophoneRouteCoordinator.swift */; };
 		3C58D18F7DB8FECDED6194E9 /* MacAssistantApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AD5C8115BE3ABE4E1E89A15 /* MacAssistantApp.swift */; };
 		49D8F14F21FE6236DADB5E92 /* LoadingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 160B2D5F076DEED6393DBC25 /* LoadingView.swift */; };
+		5B84091AF9D17743E688579E /* SettingsRuntimeLogsPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19613F530A90FB6915E2A883 /* SettingsRuntimeLogsPane.swift */; };
+		7943FBD191DA03AD6DA1FF8A /* ChatRenderingSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2AE81DCDCB0FBE8B411EA851 /* ChatRenderingSupport.swift */; };
 		7FC1C1E8AFA73CD97AA10B20 /* WindowAccessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7D37B1DB182A6648F0479C4 /* WindowAccessor.swift */; };
 		8BD6C8247016B7E9036BF93F /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E1E3404B396772350A973A4 /* ChatView.swift */; };
 		8EFDEB4194133445220AF158 /* AppTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3481885D5990F54C35169A08 /* AppTheme.swift */; };
+		944F8F15B2B589BDF826AEEB /* SettingsModelFilesPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2D0BFCD79DFEBCD2094326F /* SettingsModelFilesPane.swift */; };
+		9C99156819F7CABBB256B1A7 /* SettingsGeneralPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E4CBD10523D8F4BB0E96888 /* SettingsGeneralPane.swift */; };
 		9F0A88DEC3B8D0B74DE4C9DD /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E7FB81BABE071202FE48543 /* SettingsView.swift */; };
 		A56BE4A0FA267A74050FC804 /* JSONValue.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8918E743291CE94A6CBF754B /* JSONValue.swift */; };
 		A9F0347498FB45CAB9044646 /* ModelState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27ACA2CE79F32A367667CA90 /* ModelState.swift */; };
 		C5D313C7462FA9A00B8E37A4 /* MacAssistantTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D05985224FF03BA59EEB8B2 /* MacAssistantTests.swift */; };
+		C9038D7524E2DCD20EF07487 /* SettingsComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC44A7FC4D453644314171E2 /* SettingsComponents.swift */; };
 		CBA17252246A72A20F66DE0F /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85B985E6E4D29515D5DC7F07 /* RootView.swift */; };
 		D5EA65D4396B8C37A7A6AB4B /* ConversationModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B9E5935A1ED97CB5FB7B7E2 /* ConversationModels.swift */; };
 		E4FD71E733A11D3E7C02A836 /* AgentRuntimeClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A04DE99F34D16ED9BD2547D5 /* AgentRuntimeClient.swift */; };
@@ -43,10 +48,13 @@
 		0FCECCE678D142B8E5739B9E /* SetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SetupView.swift; sourceTree = "<group>"; };
 		126A5A738B2A1C1A97582723 /* AudioPlaybackService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioPlaybackService.swift; sourceTree = "<group>"; };
 		160B2D5F076DEED6393DBC25 /* LoadingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoadingView.swift; sourceTree = "<group>"; };
+		19613F530A90FB6915E2A883 /* SettingsRuntimeLogsPane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsRuntimeLogsPane.swift; sourceTree = "<group>"; };
 		1E7FB81BABE071202FE48543 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		1F3CE5CED55C0E95E280709E /* MacAssistantTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MacAssistantTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		27ACA2CE79F32A367667CA90 /* ModelState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelState.swift; sourceTree = "<group>"; };
+		2AE81DCDCB0FBE8B411EA851 /* ChatRenderingSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatRenderingSupport.swift; sourceTree = "<group>"; };
 		3481885D5990F54C35169A08 /* AppTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppTheme.swift; sourceTree = "<group>"; };
+		4E4CBD10523D8F4BB0E96888 /* SettingsGeneralPane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsGeneralPane.swift; sourceTree = "<group>"; };
 		5E1E3404B396772350A973A4 /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
 		6AD5C8115BE3ABE4E1E89A15 /* MacAssistantApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacAssistantApp.swift; sourceTree = "<group>"; };
 		7D05985224FF03BA59EEB8B2 /* MacAssistantTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacAssistantTests.swift; sourceTree = "<group>"; };
@@ -54,6 +62,8 @@
 		8918E743291CE94A6CBF754B /* JSONValue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONValue.swift; sourceTree = "<group>"; };
 		A04DE99F34D16ED9BD2547D5 /* AgentRuntimeClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRuntimeClient.swift; sourceTree = "<group>"; };
 		A77E051E514F7DA5879DFFA6 /* MicrophoneRouteCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MicrophoneRouteCoordinator.swift; sourceTree = "<group>"; };
+		BC44A7FC4D453644314171E2 /* SettingsComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsComponents.swift; sourceTree = "<group>"; };
+		C2D0BFCD79DFEBCD2094326F /* SettingsModelFilesPane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsModelFilesPane.swift; sourceTree = "<group>"; };
 		C424EA90E96E45DBDAF97316 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
 		D7F68849AD6507645F60973D /* MacAssistant.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MacAssistant.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		F5DC30E4BB0F4E09D1296AF0 /* MicrophoneCaptureService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MicrophoneCaptureService.swift; sourceTree = "<group>"; };
@@ -122,6 +132,7 @@
 		89B82A8E2320D8C5AE15165D /* Chat */ = {
 			isa = PBXGroup;
 			children = (
+				2AE81DCDCB0FBE8B411EA851 /* ChatRenderingSupport.swift */,
 				5E1E3404B396772350A973A4 /* ChatView.swift */,
 			);
 			path = Chat;
@@ -130,6 +141,10 @@
 		A8265A6C7DB6B1EA05AD0E6C /* Settings */ = {
 			isa = PBXGroup;
 			children = (
+				BC44A7FC4D453644314171E2 /* SettingsComponents.swift */,
+				4E4CBD10523D8F4BB0E96888 /* SettingsGeneralPane.swift */,
+				C2D0BFCD79DFEBCD2094326F /* SettingsModelFilesPane.swift */,
+				19613F530A90FB6915E2A883 /* SettingsRuntimeLogsPane.swift */,
 				1E7FB81BABE071202FE48543 /* SettingsView.swift */,
 			);
 			path = Settings;
@@ -289,6 +304,7 @@
 				2409396868DD30BAA7842038 /* AppModel.swift in Sources */,
 				8EFDEB4194133445220AF158 /* AppTheme.swift in Sources */,
 				20D8D4AE6AE39852E15AAEB0 /* AudioPlaybackService.swift in Sources */,
+				7943FBD191DA03AD6DA1FF8A /* ChatRenderingSupport.swift in Sources */,
 				8BD6C8247016B7E9036BF93F /* ChatView.swift in Sources */,
 				D5EA65D4396B8C37A7A6AB4B /* ConversationModels.swift in Sources */,
 				A56BE4A0FA267A74050FC804 /* JSONValue.swift in Sources */,
@@ -299,6 +315,10 @@
 				A9F0347498FB45CAB9044646 /* ModelState.swift in Sources */,
 				CBA17252246A72A20F66DE0F /* RootView.swift in Sources */,
 				108333BE64E44CDFBE26475C /* RuntimeProtocol.swift in Sources */,
+				C9038D7524E2DCD20EF07487 /* SettingsComponents.swift in Sources */,
+				9C99156819F7CABBB256B1A7 /* SettingsGeneralPane.swift in Sources */,
+				944F8F15B2B589BDF826AEEB /* SettingsModelFilesPane.swift in Sources */,
+				5B84091AF9D17743E688579E /* SettingsRuntimeLogsPane.swift in Sources */,
 				9F0A88DEC3B8D0B74DE4C9DD /* SettingsView.swift in Sources */,
 				28318AF05C082FEFE9CA2B0C /* SetupView.swift in Sources */,
 				7FC1C1E8AFA73CD97AA10B20 /* WindowAccessor.swift in Sources */,

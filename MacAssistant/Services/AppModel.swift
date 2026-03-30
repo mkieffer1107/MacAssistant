@@ -4,10 +4,19 @@ import Observation
 import SwiftUI
 import UniformTypeIdentifiers
 
+struct RuntimeLogEntry: Identifiable, Equatable, Sendable {
+    let id: Int
+    let text: String
+    let byteCount: Int
+}
+
 @MainActor
 @Observable
 final class AppModel {
     static let defaultImagePrompt = "Describe this image."
+    private static let runtimeLogMaxLineCount = 1_000
+    private static let runtimeLogMaxByteCount = 1_048_576
+    private static let legacyAudioCacheMaxAge: TimeInterval = 7 * 24 * 60 * 60
 
     enum Phase {
         case bootstrapping
@@ -146,6 +155,26 @@ final class AppModel {
         }
     }
 
+    struct SettingsGeneralSnapshot: Equatable, Sendable {
+        let defaultVoicePreset: String
+        let selectedInputDevicePickerValue: String
+        let launchOnOpen: Bool
+        let alwaysAcceptToolCalls: Bool
+        let streamReplySpeechWhileGenerating: Bool
+        let availableInputDevices: [MicrophoneCaptureService.InputDevice]
+        let unavailableSelectedInputDeviceUID: String?
+    }
+
+    struct SettingsModelFilesSnapshot: Equatable, Sendable {
+        let entries: [ModelFileEntry]
+    }
+
+    struct SettingsRuntimeLogsSnapshot: Equatable, Sendable {
+        let entries: [RuntimeLogEntry]
+        let lineCount: Int
+        let byteCount: Int
+    }
+
     private let appSupportURL: URL
     private let shouldPersistSettings: Bool
     @ObservationIgnored private let runtime: any RuntimeClienting
@@ -183,7 +212,9 @@ final class AppModel {
     var availableInputDevices: [MicrophoneCaptureService.InputDevice] = []
     var isMicReady = false
     var isStopping = false
-    var runtimeLogs: [String] = []
+    var runtimeLogEntries: [RuntimeLogEntry] = []
+    var runtimeLogLineCount = 0
+    var runtimeLogByteCount = 0
     var permissionsSummary = "Microphone access is required. Automation and Accessibility permissions are granted by macOS when tool calls run."
     var showingSettings = false
     var settings = SettingsState() {
@@ -342,6 +373,32 @@ final class AppModel {
         return availableInputDevices.contains(where: { $0.uid == uid }) ? nil : uid
     }
 
+    var settingsGeneralSnapshot: SettingsGeneralSnapshot {
+        SettingsGeneralSnapshot(
+            defaultVoicePreset: settings.defaultVoicePreset,
+            selectedInputDevicePickerValue: selectedInputDevicePickerValue,
+            launchOnOpen: settings.launchOnOpen,
+            alwaysAcceptToolCalls: settings.alwaysAcceptToolCalls,
+            streamReplySpeechWhileGenerating: settings.streamReplySpeechWhileGenerating,
+            availableInputDevices: availableInputDevices,
+            unavailableSelectedInputDeviceUID: unavailableSelectedInputDeviceUID
+        )
+    }
+
+    var settingsModelFilesSnapshot: SettingsModelFilesSnapshot {
+        SettingsModelFilesSnapshot(
+            entries: RuntimeModelID.allCases.map(settingsModelFileEntry(for:))
+        )
+    }
+
+    var settingsRuntimeLogsSnapshot: SettingsRuntimeLogsSnapshot {
+        SettingsRuntimeLogsSnapshot(
+            entries: runtimeLogEntries,
+            lineCount: runtimeLogLineCount,
+            byteCount: runtimeLogByteCount
+        )
+    }
+
     private var voiceRecordingStatusSummary: String {
         switch voiceRecordingDisplayPhase {
         case .waitingForAudio:
@@ -383,6 +440,8 @@ final class AppModel {
     @ObservationIgnored private var microphoneRoutePreflightTask: Task<Void, Never>?
     @ObservationIgnored private var microphoneAccessTask: Task<Void, Never>?
     @ObservationIgnored private var assistantDeltaFlushTask: Task<Void, Never>?
+    @ObservationIgnored private var runtimeLogsTextCache = ""
+    @ObservationIgnored private var nextRuntimeLogEntryID = 0
 
     private var attachmentsDirectoryURL: URL {
         appSupportURL.appendingPathComponent("attachments", isDirectory: true)
@@ -491,6 +550,7 @@ final class AppModel {
         bootstrapMessages = ["Opening the bundled runtime helper."]
         do {
             try FileManager.default.createDirectory(at: appSupportURL, withIntermediateDirectories: true)
+            pruneLegacyAudioCacheIfNeeded()
             try runtime.start()
             try runtime.send(RuntimeCommandEnvelope(
                 type: "bootstrap",
@@ -538,6 +598,16 @@ final class AppModel {
 
     func setSelectedInputDevicePickerValue(_ value: String) {
         settings.inputDevicePreference = value.isEmpty ? .automatic : .specificDeviceUID(value)
+    }
+
+    func handleSettingsModelFileAction(_ action: ModelFileAction) {
+        switch action {
+        case .installInstallable(let installableID):
+            guard let installable = modelInstallables.first(where: { $0.id == installableID }) else { return }
+            install(installable)
+        case .deleteModel(let modelID):
+            deleteModel(modelID)
+        }
     }
 
     func shutdown() {
@@ -1629,6 +1699,12 @@ final class AppModel {
         copyTextToPasteboard(runtimeLogsText)
     }
 
+    func appendSettingsNavigationDiagnostic(tabName: String, modelFileRowCount: Int) {
+        appendRuntimeLog(
+            "[Settings] Selected \(tabName) tab (retained logs: \(runtimeLogLineCount), model file rows: \(modelFileRowCount))."
+        )
+    }
+
     private func sendAudioChunk(_ chunk: MicrophoneCaptureService.CaptureChunk, turnID: String) throws {
         let base64 = chunk.data.base64EncodedString()
         try runtime.send(RuntimeCommandEnvelope(
@@ -1648,7 +1724,7 @@ final class AppModel {
     }
 
     var runtimeLogsText: String {
-        runtimeLogs.joined(separator: "\n")
+        runtimeLogsTextCache
     }
 
     func handle(event: RuntimeEventEnvelope) {
@@ -1813,6 +1889,7 @@ final class AppModel {
             toolCallID: toolCallID,
             name: toolName,
             arguments: event.toolArguments ?? [:],
+            prettyArguments: prettyPrintedToolArguments(event.toolArguments ?? [:]),
             safetyClass: SafetyClass(rawValue: event.safetyClass ?? "") ?? .readOnly,
             approvalState: approvalState,
             executionState: ExecutionState(rawValue: event.executionState ?? "") ?? .proposed,
@@ -1926,7 +2003,16 @@ final class AppModel {
     private func appendRuntimeLog(_ message: String) {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        runtimeLogs.append(trimmed)
+        let entry = RuntimeLogEntry(
+            id: nextRuntimeLogEntryID,
+            text: trimmed,
+            byteCount: trimmed.lengthOfBytes(using: .utf8)
+        )
+        nextRuntimeLogEntryID &+= 1
+        runtimeLogEntries.append(entry)
+        runtimeLogByteCount += entry.byteCount + (runtimeLogEntries.count > 1 ? 1 : 0)
+        trimRuntimeLogBufferIfNeeded()
+        refreshRuntimeLogDerivedState()
     }
 
     private func pendingVoiceDraftCleanup() {
@@ -1984,6 +2070,81 @@ final class AppModel {
 
         let downloadingIDs = Set(modelInstallables.lazy.filter { $0.installState == .downloading }.map(\.id))
         downloadProgressByInstallable = downloadProgressByInstallable.filter { downloadingIDs.contains($0.key) }
+    }
+
+    private func settingsModelFileEntry(for modelID: RuntimeModelID) -> ModelFileEntry {
+        let installable = settingsModelInstallable(for: modelID)
+        let underlyingState = settingsUnderlyingModelState(for: modelID)
+
+        return ModelFileEntry(
+            id: modelID.rawValue,
+            title: settingsModelFileTitle(for: modelID),
+            summary: modelID.summary,
+            systemImage: modelID.systemImage,
+            installState: underlyingState.installState,
+            warmState: underlyingState.warmState,
+            lastError: underlyingState.lastError ?? installable?.lastError,
+            progress: installable.flatMap { downloadProgress(for: $0.id) },
+            actionTitle: settingsModelFileActionTitle(for: installable, installState: underlyingState.installState),
+            action: settingsModelFileAction(for: modelID, installable: installable, installState: underlyingState.installState)
+        )
+    }
+
+    private func settingsModelInstallable(for modelID: RuntimeModelID) -> ModelInstallable? {
+        let installableID = switch modelID {
+        case .agentModel:
+            "agent_model"
+        case .ttsModel, .sttModel:
+            "voice_pack"
+        }
+
+        return modelInstallables.first(where: { $0.id == installableID })
+    }
+
+    private func settingsUnderlyingModelState(for modelID: RuntimeModelID) -> UnderlyingModelState {
+        underlyingModels[modelID.rawValue]
+            ?? UnderlyingModelState(id: modelID.rawValue, installState: .missing, warmState: .cold, lastError: nil)
+    }
+
+    private func settingsModelFileTitle(for modelID: RuntimeModelID) -> String {
+        switch modelID {
+        case .sttModel:
+            return "Transcription"
+        case .agentModel, .ttsModel:
+            return modelID.title
+        }
+    }
+
+    private func settingsModelFileAction(
+        for modelID: RuntimeModelID,
+        installable: ModelInstallable?,
+        installState: ModelInstallState
+    ) -> ModelFileAction? {
+        switch installState {
+        case .installed:
+            return .deleteModel(modelID)
+        case .missing, .failed:
+            guard let installable, installable.installState != .downloading else { return nil }
+            return .installInstallable(installable.id)
+        case .downloading:
+            return nil
+        }
+    }
+
+    private func settingsModelFileActionTitle(
+        for installable: ModelInstallable?,
+        installState: ModelInstallState
+    ) -> String? {
+        switch installState {
+        case .installed:
+            return "Delete"
+        case .missing:
+            return installable?.installState == .downloading ? nil : "Install"
+        case .failed:
+            return installable?.installState == .downloading ? nil : "Retry"
+        case .downloading:
+            return nil
+        }
     }
 
     private func appendBootstrapMessage(_ message: String) {
@@ -2701,5 +2862,69 @@ final class AppModel {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
+    }
+
+    private func trimRuntimeLogBufferIfNeeded() {
+        while runtimeLogEntries.count > Self.runtimeLogMaxLineCount || runtimeLogByteCount > Self.runtimeLogMaxByteCount {
+            guard !runtimeLogEntries.isEmpty else {
+                runtimeLogByteCount = 0
+                return
+            }
+            let removedEntry = runtimeLogEntries.removeFirst()
+            runtimeLogByteCount = max(
+                0,
+                runtimeLogByteCount - removedEntry.byteCount - (runtimeLogEntries.isEmpty ? 0 : 1)
+            )
+        }
+    }
+
+    private func refreshRuntimeLogDerivedState() {
+        runtimeLogLineCount = runtimeLogEntries.count
+        runtimeLogsTextCache = runtimeLogEntries.map(\.text).joined(separator: "\n")
+        runtimeLogByteCount = runtimeLogsTextCache.lengthOfBytes(using: .utf8)
+    }
+
+    private func prettyPrintedToolArguments(_ arguments: [String: JSONValue]) -> String {
+        guard !arguments.isEmpty else { return "{}" }
+        guard let data = try? JSONEncoder().encode(arguments),
+              let string = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return string
+    }
+
+    private func pruneLegacyAudioCacheIfNeeded() {
+        let cacheURL = appSupportURL.appendingPathComponent("cache", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: cacheURL.path) else { return }
+
+        let cutoffDate = Date().addingTimeInterval(-Self.legacyAudioCacheMaxAge)
+        let resourceKeys: Set<URLResourceKey> = [.contentModificationDateKey, .isRegularFileKey]
+        guard let enumerator = FileManager.default.enumerator(
+            at: cacheURL,
+            includingPropertiesForKeys: Array(resourceKeys),
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+
+        var removedCount = 0
+        for case let fileURL as URL in enumerator {
+            guard fileURL.pathExtension.lowercased() == "wav" else { continue }
+            guard let values = try? fileURL.resourceValues(forKeys: resourceKeys),
+                  values.isRegularFile == true,
+                  let modificationDate = values.contentModificationDate,
+                  modificationDate < cutoffDate else {
+                continue
+            }
+            do {
+                try FileManager.default.removeItem(at: fileURL)
+                removedCount += 1
+            } catch {
+                appendRuntimeLog("[Maintenance] Failed to remove stale cached audio file \(fileURL.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+
+        guard removedCount > 0 else { return }
+        appendRuntimeLog("[Maintenance] Removed \(removedCount) stale cached audio file\(removedCount == 1 ? "" : "s").")
     }
 }
