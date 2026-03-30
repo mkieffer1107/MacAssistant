@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib.util
 import json
 import sys
 import tempfile
@@ -20,6 +21,48 @@ if str(RUNTIME_DIR) not in sys.path:
     sys.path.insert(0, str(RUNTIME_DIR))
 
 import agent_runtime_host as runtime_host
+
+HAS_MLX_AUDIO = importlib.util.find_spec("mlx_audio") is not None
+
+
+class TestRuntimeHost(runtime_host.RuntimeHost):
+    def __init__(self) -> None:
+        super().__init__()
+        self.events: list[dict[str, object]] = []
+
+    def emit(self, payload: dict[str, object]) -> None:
+        self.events.append(dict(payload))
+
+    async def warm_model(self, model_id: str, arguments: dict[str, object]) -> None:
+        return None
+
+    def require_model(self, model_id: str, model: object) -> None:
+        return None
+
+    async def refresh_tool_definitions(self, force: bool = False) -> None:
+        return None
+
+
+def assistant_segments(events: list[dict[str, object]]) -> list[dict[str, object]]:
+    ordered: list[dict[str, object]] = []
+    by_id: dict[str, dict[str, object]] = {}
+    for event in events:
+        if event.get("type") != "assistant_delta":
+            continue
+        segment_id = str(event.get("assistantSegmentID") or event.get("turnID"))
+        segment = by_id.get(segment_id)
+        if segment is None:
+            segment = {
+                "segment_id": segment_id,
+                "text": "",
+                "is_final": None,
+            }
+            by_id[segment_id] = segment
+            ordered.append(segment)
+        segment["text"] += str(event.get("text", ""))
+        if "isFinalSegment" in event:
+            segment["is_final"] = bool(event["isFinalSegment"])
+    return ordered
 
 
 class BufferedPreviewSessionTests(unittest.IsolatedAsyncioTestCase):
@@ -103,44 +146,24 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("".join(assistant_deltas), markdown)
 
     async def test_cancel_turn_stops_further_stream_output_and_finishes_once(self) -> None:
-        class StreamingHost(runtime_host.RuntimeHost):
+        class StreamingHost(TestRuntimeHost):
             def __init__(self) -> None:
                 super().__init__()
-                self.events: list[dict[str, object]] = []
                 self.agent_model = object()
                 self.agent_processor = object()
                 self.tts_model = object()
 
-            def emit(self, payload: dict[str, object]) -> None:
-                self.events.append(dict(payload))
-
-            async def warm_model(self, model_id: str, arguments: dict[str, object]) -> None:
-                return
-
-            def require_model(self, model_id: str, model: object) -> None:
-                return
-
-            def should_use_tool_planner(
+            async def generate_assistant_step(
                 self,
-                user_text: str,
-                attachments: list[dict[str, object]] | None,
-            ) -> bool:
-                return False
-
-            async def generate_direct_answer(
-                self,
-                user_message: dict[str, object],
+                messages: list[dict[str, object]],
                 *,
+                tool_schemas: list[dict[str, object]],
                 turn_id: str,
-            ) -> str:
-                chunks = ["Hello", " ", "world", "!"]
-                response = ""
-                for chunk in chunks:
-                    self.raise_if_turn_cancelled(turn_id)
-                    self.emit({"type": "assistant_delta", "turnID": turn_id, "text": chunk})
-                    response += chunk
-                    await asyncio.sleep(0.01)
-                return response
+            ) -> runtime_host.AssistantStepResult:
+                return runtime_host.AssistantStepResult(
+                    text="Hello world from the autonomous loop",
+                    tool_calls=[],
+                )
 
         host = StreamingHost()
         host.model_states["agent_model"] = runtime_host.ModelState(
@@ -205,7 +228,7 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
             ),
             assistant_delta_count,
         )
-        self.assertLess(assistant_delta_count, 4)
+        self.assertLess(assistant_delta_count, 7)
         self.assertEqual(
             [
                 event
@@ -228,42 +251,28 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(host.model_states["tts_model"].warm)
 
     async def test_cancel_turn_suppresses_followup_tool_output(self) -> None:
-        class ToolHost(runtime_host.RuntimeHost):
+        class ToolHost(TestRuntimeHost):
             def __init__(self) -> None:
                 super().__init__()
-                self.events: list[dict[str, object]] = []
                 self.agent_model = object()
                 self.agent_processor = object()
 
-            def emit(self, payload: dict[str, object]) -> None:
-                self.events.append(dict(payload))
-
-            async def warm_model(self, model_id: str, arguments: dict[str, object]) -> None:
-                return
-
-            def require_model(self, model_id: str, model: object) -> None:
-                return
-
-            def should_use_tool_planner(
+            async def generate_assistant_step(
                 self,
-                user_text: str,
-                attachments: list[dict[str, object]] | None,
-            ) -> bool:
-                return True
-
-            async def generate_agent_plan(
-                self,
-                user_message: dict[str, object],
+                messages: list[dict[str, object]],
                 *,
+                tool_schemas: list[dict[str, object]],
                 turn_id: str,
-            ) -> dict[str, object]:
-                return {
-                    "assistant_message": "",
-                    "tool_call": {
-                        "name": "get_scripting_tips",
-                        "arguments": {"search_term": "Finder"},
-                    },
-                }
+            ) -> runtime_host.AssistantStepResult:
+                return runtime_host.AssistantStepResult(
+                    text="",
+                    tool_calls=[
+                        runtime_host.ToolCallRequest(
+                            name="get_scripting_tips",
+                            arguments={"search_term": "Finder"},
+                        )
+                    ],
+                )
 
             async def execute_tool(
                 self,
@@ -272,17 +281,6 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
             ) -> str:
                 await asyncio.sleep(0.05)
                 return "Tool result"
-
-            async def generate_followup_answer(
-                self,
-                user_message: dict[str, object],
-                tool_name: str,
-                tool_arguments: dict[str, object],
-                tool_result: str,
-                *,
-                turn_id: str,
-            ) -> dict[str, object]:
-                return {"assistant_message": "Follow-up answer", "tool_call": None}
 
         host = ToolHost()
 
@@ -332,38 +330,21 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_cancel_turn_stops_followup_audio_chunks(self) -> None:
-        class SpeakingHost(runtime_host.RuntimeHost):
+        class SpeakingHost(TestRuntimeHost):
             def __init__(self) -> None:
                 super().__init__()
-                self.events: list[dict[str, object]] = []
                 self.agent_model = object()
                 self.agent_processor = object()
                 self.tts_model = object()
 
-            def emit(self, payload: dict[str, object]) -> None:
-                self.events.append(dict(payload))
-
-            async def warm_model(self, model_id: str, arguments: dict[str, object]) -> None:
-                return
-
-            def require_model(self, model_id: str, model: object) -> None:
-                return
-
-            def should_use_tool_planner(
+            async def generate_assistant_step(
                 self,
-                user_text: str,
-                attachments: list[dict[str, object]] | None,
-            ) -> bool:
-                return False
-
-            async def generate_direct_answer(
-                self,
-                user_message: dict[str, object],
+                messages: list[dict[str, object]],
                 *,
+                tool_schemas: list[dict[str, object]],
                 turn_id: str,
-            ) -> str:
-                self.emit({"type": "assistant_delta", "turnID": turn_id, "text": "Hello"})
-                return "Hello"
+            ) -> runtime_host.AssistantStepResult:
+                return runtime_host.AssistantStepResult(text="Hello", tool_calls=[])
 
             def iter_tts_pcm_chunks(
                 self,
@@ -376,7 +357,7 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
                     if cancel_event is not None and cancel_event.is_set():
                         break
                     yield f"chunk-{index}".encode("utf-8")
-                    time.sleep(0.01)
+                    time.sleep(0.03)
 
         host = SpeakingHost()
 
@@ -488,35 +469,19 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(event.get("audioEncoding") == "pcm_s16le" for event in audio_events))
 
     async def test_send_text_with_spoken_reply_uses_streamed_pcm_chunk_path(self) -> None:
-        class ReplyHost(runtime_host.RuntimeHost):
+        class ReplyHost(TestRuntimeHost):
             def __init__(self) -> None:
                 super().__init__()
-                self.events: list[dict[str, object]] = []
                 self.tts_model = object()
 
-            def emit(self, payload: dict[str, object]) -> None:
-                self.events.append(dict(payload))
-
-            async def warm_model(self, model_id: str, arguments: dict[str, object]) -> None:
-                return
-
-            def require_model(self, model_id: str, model: object) -> None:
-                return
-
-            def should_use_tool_planner(
+            async def generate_assistant_step(
                 self,
-                user_text: str,
-                attachments: list[dict[str, object]] | None,
-            ) -> bool:
-                return False
-
-            async def generate_direct_answer(
-                self,
-                user_message: dict[str, object],
+                messages: list[dict[str, object]],
                 *,
+                tool_schemas: list[dict[str, object]],
                 turn_id: str,
-            ) -> str:
-                return "Hello"
+            ) -> runtime_host.AssistantStepResult:
+                return runtime_host.AssistantStepResult(text="Hello", tool_calls=[])
 
             def iter_tts_pcm_chunks(
                 self,
@@ -555,6 +520,7 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
             [b"one", b"two"],
         )
 
+    @unittest.skipUnless(HAS_MLX_AUDIO, "mlx_audio is required for tokenizer patch coverage.")
     def test_patch_tts_runtime_replaces_broken_tokenizer_with_tekken_shim(self) -> None:
         class BrokenTokenizer:
             def encode(self, text: str) -> list[int]:
@@ -594,6 +560,7 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model.sync_calls, 1)
         mock_from_file.assert_called_once()
 
+    @unittest.skipUnless(HAS_MLX_AUDIO, "mlx_audio is required for tokenizer recovery coverage.")
     async def test_speak_text_recovers_when_loaded_tts_tokenizer_lacks_voice_metadata(self) -> None:
         class BrokenTokenizer:
             def encode(self, text: str) -> list[int]:
@@ -628,10 +595,9 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
                     self.used_fallback_path = True
                 yield FakeAudioResult()
 
-        class SpeakingHost(runtime_host.RuntimeHost):
+        class SpeakingHost(TestRuntimeHost):
             def __init__(self, model_path: Path) -> None:
                 super().__init__()
-                self.events: list[dict[str, object]] = []
                 self.tts_model = FakeTTSModel()
                 self.model_states["tts_model"] = runtime_host.ModelState(
                     installed=True,
@@ -640,14 +606,17 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
                     last_error=None,
                 )
 
-            def emit(self, payload: dict[str, object]) -> None:
-                self.events.append(dict(payload))
-
             async def warm_model(self, model_id: str, arguments: dict[str, object]) -> None:
                 self.patch_tts_runtime(self.tts_model, Path(self.model_states["tts_model"].path))
 
-            def require_model(self, model_id: str, model: object) -> None:
-                return
+            async def generate_assistant_step(
+                self,
+                messages: list[dict[str, object]],
+                *,
+                tool_schemas: list[dict[str, object]],
+                turn_id: str,
+            ) -> runtime_host.AssistantStepResult:
+                return runtime_host.AssistantStepResult(text="Hello", tool_calls=[])
 
         with tempfile.TemporaryDirectory() as tmpdir:
             model_path = Path(tmpdir)
@@ -681,6 +650,7 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(host.tts_model.sync_calls, 1)
         self.assertTrue(host.tts_model.used_fallback_path)
 
+    @unittest.skipUnless(HAS_MLX_AUDIO, "mlx_audio is required for tokenizer recovery coverage.")
     async def test_send_text_with_spoken_reply_recovers_when_loaded_tts_tokenizer_lacks_voice_metadata(self) -> None:
         class BrokenTokenizer:
             def encode(self, text: str) -> list[int]:
@@ -715,10 +685,9 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
                     self.used_fallback_path = True
                 yield FakeAudioResult()
 
-        class ReplyHost(runtime_host.RuntimeHost):
+        class ReplyHost(TestRuntimeHost):
             def __init__(self, model_path: Path) -> None:
                 super().__init__()
-                self.events: list[dict[str, object]] = []
                 self.tts_model = FakeTTSModel()
                 self.model_states["tts_model"] = runtime_host.ModelState(
                     installed=True,
@@ -727,30 +696,18 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
                     last_error=None,
                 )
 
-            def emit(self, payload: dict[str, object]) -> None:
-                self.events.append(dict(payload))
-
             async def warm_model(self, model_id: str, arguments: dict[str, object]) -> None:
                 if model_id == "tts_model":
                     self.patch_tts_runtime(self.tts_model, Path(self.model_states["tts_model"].path))
 
-            def require_model(self, model_id: str, model: object) -> None:
-                return
-
-            def should_use_tool_planner(
+            async def generate_assistant_step(
                 self,
-                user_text: str,
-                attachments: list[dict[str, object]] | None,
-            ) -> bool:
-                return False
-
-            async def generate_direct_answer(
-                self,
-                user_message: dict[str, object],
+                messages: list[dict[str, object]],
                 *,
+                tool_schemas: list[dict[str, object]],
                 turn_id: str,
-            ) -> str:
-                return "Hello"
+            ) -> runtime_host.AssistantStepResult:
+                return runtime_host.AssistantStepResult(text="Hello", tool_calls=[])
 
         with tempfile.TemporaryDirectory() as tmpdir:
             model_path = Path(tmpdir)
@@ -1303,42 +1260,21 @@ class SamplingPresetTests(unittest.TestCase):
 
 
 class TurnRoutingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_text_only_question_uses_direct_answer_fast_path(self) -> None:
-        class RecordingHost(runtime_host.RuntimeHost):
+    async def test_text_only_question_runs_through_agent_loop(self) -> None:
+        class RecordingHost(TestRuntimeHost):
             def __init__(self) -> None:
                 super().__init__()
-                self.events: list[dict[str, object]] = []
-                self.streamed: list[tuple[str, str]] = []
-                self.direct_answer_calls = 0
-                self.planner_calls = 0
+                self.generated_messages: list[dict[str, object]] = []
 
-            def emit(self, payload: dict[str, object]) -> None:
-                self.events.append(payload)
-
-            async def warm_model(self, model_id: str, arguments: dict[str, object]) -> None:
-                return None
-
-            async def generate_direct_answer(
+            async def generate_assistant_step(
                 self,
-                user_message: dict[str, object],
+                messages: list[dict[str, object]],
                 *,
+                tool_schemas: list[dict[str, object]],
                 turn_id: str,
-            ) -> str:
-                self.direct_answer_calls += 1
-                self.streamed.append((turn_id, "Direct reply"))
-                return "Direct reply"
-
-            async def generate_agent_plan(
-                self,
-                user_message: dict[str, object],
-                *,
-                turn_id: str,
-            ) -> dict[str, object]:
-                self.planner_calls += 1
-                raise AssertionError("Planner should not run for simple text-only chat.")
-
-            async def stream_assistant_text(self, turn_id: str, text: str) -> None:
-                self.streamed.append((turn_id, text))
+            ) -> runtime_host.AssistantStepResult:
+                self.generated_messages = json.loads(json.dumps(messages))
+                return runtime_host.AssistantStepResult(text="Direct reply", tool_calls=[])
 
         host = RecordingHost()
 
@@ -1350,47 +1286,27 @@ class TurnRoutingTests(unittest.IsolatedAsyncioTestCase):
             voice_preset="casual_male",
         )
 
-        self.assertEqual(host.direct_answer_calls, 1)
-        self.assertEqual(host.planner_calls, 0)
-        self.assertEqual(host.streamed, [("turn-1", "Direct reply")])
+        self.assertEqual(len(host.generated_messages), 2)
+        self.assertEqual(host.generated_messages[0]["role"], "system")
+        self.assertEqual(host.generated_messages[1], {"role": "user", "content": "What is polymorphism?"})
         self.assertEqual(host.history[-1], {"role": "assistant", "content": "Direct reply"})
         self.assertEqual(host.events[-1], {"type": "turn_finished", "turnID": "turn-1", "status": "finished", "isFinal": True})
 
-    async def test_image_turn_still_uses_planner_path(self) -> None:
-        class RecordingHost(runtime_host.RuntimeHost):
+    async def test_image_turn_preserves_multimodal_user_message(self) -> None:
+        class RecordingHost(TestRuntimeHost):
             def __init__(self) -> None:
                 super().__init__()
-                self.events: list[dict[str, object]] = []
-                self.streamed: list[tuple[str, str]] = []
-                self.direct_answer_calls = 0
-                self.planner_calls = 0
+                self.generated_messages: list[dict[str, object]] = []
 
-            def emit(self, payload: dict[str, object]) -> None:
-                self.events.append(payload)
-
-            async def warm_model(self, model_id: str, arguments: dict[str, object]) -> None:
-                return None
-
-            async def generate_direct_answer(
+            async def generate_assistant_step(
                 self,
-                user_message: dict[str, object],
+                messages: list[dict[str, object]],
                 *,
+                tool_schemas: list[dict[str, object]],
                 turn_id: str,
-            ) -> str:
-                self.direct_answer_calls += 1
-                raise AssertionError("Direct answer path should not handle image turns.")
-
-            async def generate_agent_plan(
-                self,
-                user_message: dict[str, object],
-                *,
-                turn_id: str,
-            ) -> dict[str, object]:
-                self.planner_calls += 1
-                return {"assistant_message": "Planned reply", "tool_call": None}
-
-            async def stream_assistant_text(self, turn_id: str, text: str) -> None:
-                self.streamed.append((turn_id, text))
+            ) -> runtime_host.AssistantStepResult:
+                self.generated_messages = json.loads(json.dumps(messages))
+                return runtime_host.AssistantStepResult(text="Planned reply", tool_calls=[])
 
         host = RecordingHost()
 
@@ -1402,9 +1318,440 @@ class TurnRoutingTests(unittest.IsolatedAsyncioTestCase):
             voice_preset="casual_male",
         )
 
-        self.assertEqual(host.direct_answer_calls, 0)
-        self.assertEqual(host.planner_calls, 1)
-        self.assertEqual(host.streamed, [("turn-2", "Planned reply")])
+        self.assertEqual(len(host.generated_messages), 2)
+        self.assertEqual(host.generated_messages[1]["role"], "user")
+        self.assertEqual(
+            host.generated_messages[1]["content"],
+            [
+                {"type": "input_image", "image_url": "/tmp/test.png"},
+                {"type": "text", "text": "Describe this image."},
+            ],
+        )
+
+
+class SequentialToolLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def wait_for_condition(
+        self,
+        predicate,
+        *,
+        timeout: float = 0.5,
+        interval: float = 0.005,
+    ) -> None:
+        async def waiter() -> None:
+            while not predicate():
+                await asyncio.sleep(interval)
+
+        await asyncio.wait_for(waiter(), timeout=timeout)
+
+    async def test_tool_failure_is_fed_back_and_model_retries_in_same_turn(self) -> None:
+        class RetryHost(TestRuntimeHost):
+            def __init__(self) -> None:
+                super().__init__()
+                self.step_calls = 0
+                self.tool_attempts = 0
+                self.message_snapshots: list[list[dict[str, object]]] = []
+
+            async def generate_assistant_step(
+                self,
+                messages: list[dict[str, object]],
+                *,
+                tool_schemas: list[dict[str, object]],
+                turn_id: str,
+            ) -> runtime_host.AssistantStepResult:
+                self.message_snapshots.append(json.loads(json.dumps(messages)))
+                if self.step_calls == 0:
+                    self.step_calls += 1
+                    return runtime_host.AssistantStepResult(
+                        text="Checking Finder.",
+                        tool_calls=[
+                            runtime_host.ToolCallRequest(
+                                name="get_scripting_tips",
+                                arguments={"search_term": "Finder"},
+                            )
+                        ],
+                    )
+                if self.step_calls == 1:
+                    self.step_calls += 1
+                    assert "Tool failed: temporary failure" in messages[-1]["content"]
+                    return runtime_host.AssistantStepResult(
+                        text="Retrying with the tool output in mind.",
+                        tool_calls=[
+                            runtime_host.ToolCallRequest(
+                                name="get_scripting_tips",
+                                arguments={"search_term": "Finder"},
+                            )
+                        ],
+                    )
+                assert "Recovered result" in messages[-1]["content"]
+                return runtime_host.AssistantStepResult(text="All set.", tool_calls=[])
+
+            async def execute_tool(
+                self,
+                tool_name: str,
+                tool_arguments: dict[str, object],
+            ) -> str:
+                self.tool_attempts += 1
+                if self.tool_attempts == 1:
+                    raise RuntimeError("temporary failure")
+                return "Recovered result"
+
+        host = RetryHost()
+
+        await host.run_turn(
+            turn_id="retry-turn",
+            user_text="Help with Finder",
+            attachments=[],
+            speak_reply=False,
+            voice_preset="casual_male",
+        )
+
+        self.assertEqual(host.tool_attempts, 2)
+        segments = assistant_segments(host.events)
+        self.assertEqual(
+            [segment["text"] for segment in segments],
+            ["Checking Finder.", "Retrying with the tool output in mind.", "All set."],
+        )
+        self.assertEqual([segment["is_final"] for segment in segments], [False, False, True])
+        self.assertEqual(
+            host.history,
+            [
+                {"role": "user", "content": "Help with Finder"},
+                {"role": "assistant", "content": "All set."},
+            ],
+        )
+
+    async def test_multi_step_loop_runs_until_no_tool_call_remains(self) -> None:
+        class MultiStepHost(TestRuntimeHost):
+            def __init__(self) -> None:
+                super().__init__()
+                self.step_calls = 0
+                self.tool_runs: list[str] = []
+
+            async def generate_assistant_step(
+                self,
+                messages: list[dict[str, object]],
+                *,
+                tool_schemas: list[dict[str, object]],
+                turn_id: str,
+            ) -> runtime_host.AssistantStepResult:
+                if self.step_calls == 0:
+                    self.step_calls += 1
+                    return runtime_host.AssistantStepResult(
+                        text="Looking up the first step.",
+                        tool_calls=[
+                            runtime_host.ToolCallRequest(
+                                name="get_scripting_tips",
+                                arguments={"search_term": "Finder"},
+                            )
+                        ],
+                    )
+                if self.step_calls == 1:
+                    self.step_calls += 1
+                    assert "tool_response" in messages[-1]["content"]
+                    return runtime_host.AssistantStepResult(
+                        text="That worked. Checking one more thing.",
+                        tool_calls=[
+                            runtime_host.ToolCallRequest(
+                                name="get_scripting_tips",
+                                arguments={"search_term": "Mail"},
+                            )
+                        ],
+                    )
+                self.step_calls += 1
+                assert "Mail" in messages[-1]["content"]
+                return runtime_host.AssistantStepResult(text="Finished after both checks.", tool_calls=[])
+
+            async def execute_tool(
+                self,
+                tool_name: str,
+                tool_arguments: dict[str, object],
+            ) -> str:
+                search_term = str(tool_arguments["search_term"])
+                self.tool_runs.append(search_term)
+                return f"result:{search_term}"
+
+        host = MultiStepHost()
+
+        await host.run_turn(
+            turn_id="multi-turn",
+            user_text="Check Finder and Mail",
+            attachments=[],
+            speak_reply=False,
+            voice_preset="casual_male",
+        )
+
+        self.assertEqual(host.step_calls, 3)
+        self.assertEqual(host.tool_runs, ["Finder", "Mail"])
+        self.assertEqual(
+            host.history,
+            [
+                {"role": "user", "content": "Check Finder and Mail"},
+                {"role": "assistant", "content": "Finished after both checks."},
+            ],
+        )
+
+    async def test_multiple_tool_calls_in_one_step_run_serially_before_next_generation(self) -> None:
+        class SerialHost(TestRuntimeHost):
+            def __init__(self) -> None:
+                super().__init__()
+                self.step_calls = 0
+                self.tool_runs: list[str] = []
+                self.followup_messages: list[dict[str, object]] = []
+
+            async def generate_assistant_step(
+                self,
+                messages: list[dict[str, object]],
+                *,
+                tool_schemas: list[dict[str, object]],
+                turn_id: str,
+            ) -> runtime_host.AssistantStepResult:
+                if self.step_calls == 0:
+                    self.step_calls += 1
+                    return runtime_host.AssistantStepResult(
+                        text="Checking both apps.",
+                        tool_calls=[
+                            runtime_host.ToolCallRequest(
+                                name="get_scripting_tips",
+                                arguments={"search_term": "Finder"},
+                            ),
+                            runtime_host.ToolCallRequest(
+                                name="get_scripting_tips",
+                                arguments={"search_term": "Mail"},
+                            ),
+                        ],
+                    )
+                self.followup_messages = json.loads(json.dumps(messages))
+                return runtime_host.AssistantStepResult(text="Done with both.", tool_calls=[])
+
+            async def execute_tool(
+                self,
+                tool_name: str,
+                tool_arguments: dict[str, object],
+            ) -> str:
+                search_term = str(tool_arguments["search_term"])
+                self.tool_runs.append(search_term)
+                return f"result:{search_term}"
+
+        host = SerialHost()
+
+        await host.run_turn(
+            turn_id="serial-turn",
+            user_text="Check both tools",
+            attachments=[],
+            speak_reply=False,
+            voice_preset="casual_male",
+        )
+
+        self.assertEqual(host.tool_runs, ["Finder", "Mail"])
+        self.assertEqual(host.followup_messages[2]["role"], "assistant")
+        self.assertEqual(len(host.followup_messages[2]["tool_calls"]), 2)
+        self.assertIn("result:Finder", host.followup_messages[3]["content"])
+        self.assertIn("result:Mail", host.followup_messages[4]["content"])
+
+    async def test_intermediate_assistant_segments_are_emitted_before_tool_steps(self) -> None:
+        class SegmentHost(TestRuntimeHost):
+            def __init__(self) -> None:
+                super().__init__()
+                self.step_calls = 0
+
+            async def generate_assistant_step(
+                self,
+                messages: list[dict[str, object]],
+                *,
+                tool_schemas: list[dict[str, object]],
+                turn_id: str,
+            ) -> runtime_host.AssistantStepResult:
+                if self.step_calls == 0:
+                    self.step_calls += 1
+                    return runtime_host.AssistantStepResult(
+                        text="First update.",
+                        tool_calls=[
+                            runtime_host.ToolCallRequest(
+                                name="get_scripting_tips",
+                                arguments={"search_term": "Finder"},
+                            )
+                        ],
+                    )
+                if self.step_calls == 1:
+                    self.step_calls += 1
+                    return runtime_host.AssistantStepResult(
+                        text="Second update.",
+                        tool_calls=[
+                            runtime_host.ToolCallRequest(
+                                name="get_scripting_tips",
+                                arguments={"search_term": "Mail"},
+                            )
+                        ],
+                    )
+                return runtime_host.AssistantStepResult(text="Done.", tool_calls=[])
+
+            async def execute_tool(
+                self,
+                tool_name: str,
+                tool_arguments: dict[str, object],
+            ) -> str:
+                return "ok"
+
+        host = SegmentHost()
+
+        await host.run_turn(
+            turn_id="segment-turn",
+            user_text="Check updates",
+            attachments=[],
+            speak_reply=False,
+            voice_preset="casual_male",
+        )
+
+        segments = assistant_segments(host.events)
+        self.assertEqual(
+            [segment["text"] for segment in segments],
+            ["First update.", "Second update.", "Done."],
+        )
+        self.assertEqual([segment["is_final"] for segment in segments], [False, False, True])
+        self.assertEqual(len({segment["segment_id"] for segment in segments}), 3)
+
+    async def test_reply_speech_starts_only_after_terminal_assistant_step(self) -> None:
+        class SpeakingLoopHost(TestRuntimeHost):
+            def __init__(self) -> None:
+                super().__init__()
+                self.tts_model = object()
+                self.step_calls = 0
+
+            async def generate_assistant_step(
+                self,
+                messages: list[dict[str, object]],
+                *,
+                tool_schemas: list[dict[str, object]],
+                turn_id: str,
+            ) -> runtime_host.AssistantStepResult:
+                if self.step_calls == 0:
+                    self.step_calls += 1
+                    return runtime_host.AssistantStepResult(
+                        text="Working on it.",
+                        tool_calls=[
+                            runtime_host.ToolCallRequest(
+                                name="get_scripting_tips",
+                                arguments={"search_term": "Finder"},
+                            )
+                        ],
+                    )
+                return runtime_host.AssistantStepResult(text="Finished.", tool_calls=[])
+
+            async def execute_tool(
+                self,
+                tool_name: str,
+                tool_arguments: dict[str, object],
+            ) -> str:
+                return "ok"
+
+            def iter_tts_pcm_chunks(
+                self,
+                *,
+                text: str,
+                voice_preset: str,
+                cancel_event: threading.Event | None = None,
+            ):
+                yield b"audio"
+
+        host = SpeakingLoopHost()
+
+        await host.run_turn(
+            turn_id="speech-turn",
+            user_text="Check and speak",
+            attachments=[],
+            speak_reply=True,
+            voice_preset="casual_male",
+        )
+
+        events = host.events
+        audio_index = next(index for index, event in enumerate(events) if event.get("type") == "audio_chunk")
+        final_segment_index = max(
+            index
+            for index, event in enumerate(events)
+            if event.get("type") == "assistant_delta" and event.get("isFinalSegment") is True
+        )
+        intermediate_segment_index = max(
+            index
+            for index, event in enumerate(events)
+            if event.get("type") == "assistant_delta" and event.get("isFinalSegment") is False
+        )
+        self.assertGreater(audio_index, final_segment_index)
+        self.assertGreater(final_segment_index, intermediate_segment_index)
+
+    async def test_approval_required_tools_resume_the_same_loop_after_approval(self) -> None:
+        class ApprovalHost(TestRuntimeHost):
+            def __init__(self) -> None:
+                super().__init__()
+                self.step_calls = 0
+
+            async def generate_assistant_step(
+                self,
+                messages: list[dict[str, object]],
+                *,
+                tool_schemas: list[dict[str, object]],
+                turn_id: str,
+            ) -> runtime_host.AssistantStepResult:
+                if self.step_calls == 0:
+                    self.step_calls += 1
+                    return runtime_host.AssistantStepResult(
+                        text="Need approval before I can continue.",
+                        tool_calls=[
+                            runtime_host.ToolCallRequest(
+                                name="execute_script",
+                                arguments={"script_content": "return 1", "language": "applescript"},
+                            )
+                        ],
+                    )
+                self.step_calls += 1
+                assert "Approved result" in messages[-1]["content"]
+                return runtime_host.AssistantStepResult(text="Done after approval.", tool_calls=[])
+
+            async def execute_tool(
+                self,
+                tool_name: str,
+                tool_arguments: dict[str, object],
+            ) -> str:
+                return "Approved result"
+
+        host = ApprovalHost()
+
+        await host.handle_command(
+            {
+                "type": "send_text",
+                "turnID": "approval-turn",
+                "text": "Run the script",
+                "speakReply": False,
+            }
+        )
+        await self.wait_for_condition(
+            lambda: any(event.get("type") == "tool_proposed" for event in host.events)
+        )
+        proposed_event = next(event for event in host.events if event.get("type") == "tool_proposed")
+
+        await host.handle_command(
+            {
+                "type": "approve_tool",
+                "turnID": "approval-turn",
+                "toolCallID": proposed_event["toolCallID"],
+            }
+        )
+        await self.wait_for_condition(
+            lambda: any(
+                event.get("type") == "turn_finished"
+                and event.get("turnID") == "approval-turn"
+                for event in host.events
+            )
+        )
+
+        self.assertEqual(host.step_calls, 2)
+        self.assertEqual(
+            host.history,
+            [
+                {"role": "user", "content": "Run the script"},
+                {"role": "assistant", "content": "Done after approval."},
+            ],
+        )
+        self.assertEqual(host.pending_tools, {})
 
 
 class ResetConversationTests(unittest.IsolatedAsyncioTestCase):
@@ -1462,33 +1809,20 @@ class ResetConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(host.model_states["agent_model"].warm)
 
     async def test_reset_conversation_removes_prior_image_context_from_next_text_turn(self) -> None:
-        class RecordingHost(runtime_host.RuntimeHost):
+        class RecordingHost(TestRuntimeHost):
             def __init__(self) -> None:
                 super().__init__()
-                self.events: list[dict[str, object]] = []
                 self.generated_messages: list[dict[str, object]] = []
 
-            def emit(self, payload: dict[str, object]) -> None:
-                self.events.append(payload)
-
-            async def warm_model(self, model_id: str, arguments: dict[str, object]) -> None:
-                return None
-
-            async def generate_text(
+            async def generate_assistant_step(
                 self,
                 messages: list[dict[str, object]],
                 *,
+                tool_schemas: list[dict[str, object]],
                 turn_id: str,
-                enable_thinking: bool,
-                task_profile: str,
-                max_tokens: int,
-                on_chunk=None,
-            ) -> str:
-                self.generated_messages = messages
-                return "Direct reply"
-
-            async def stream_assistant_text(self, turn_id: str, text: str) -> None:
-                return None
+            ) -> runtime_host.AssistantStepResult:
+                self.generated_messages = json.loads(json.dumps(messages))
+                return runtime_host.AssistantStepResult(text="Direct reply", tool_calls=[])
 
         host = RecordingHost()
         host.history = [
@@ -1602,6 +1936,26 @@ class AgentRuntimeDependencyTests(unittest.IsolatedAsyncioTestCase):
                 to_thread.assert_not_awaited()
             finally:
                 runtime_host.MANIFEST_PATH = original_manifest
+
+    def test_missing_tool_capable_chat_template_reports_reinstall_error(self) -> None:
+        host = runtime_host.RuntimeHost()
+        host.agent_processor = type("Processor", (), {"chat_template": ""})()
+        host.agent_tokenizer = type(
+            "Tokenizer",
+            (),
+            {
+                "has_chat_template": True,
+                "has_tool_calling": True,
+                "tool_parser": object(),
+            },
+        )()
+
+        with self.assertRaises(RuntimeError) as context:
+            host.assert_agent_tool_template(Path("/tmp/qwen-model"))
+
+        message = str(context.exception)
+        self.assertIn("missing its bundled Qwen chat template", message)
+        self.assertIn("Reinstall or refresh the local agent model/runtime", message)
 
 
 class MultimodalHistoryTests(unittest.TestCase):

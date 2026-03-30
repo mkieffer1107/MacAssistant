@@ -185,6 +185,163 @@ struct MacAssistantTests {
     }
 
     @Test
+    @MainActor
+    func assistantSegmentIDsCreateSeparateBubblesInterleavedWithTools() {
+        let model = AppModel()
+
+        model.handle(event: runtimeEvent(
+            type: "assistant_delta",
+            turnID: "turn-1",
+            text: "Checking the current state…",
+            assistantSegmentID: "segment-1",
+            isFinalSegment: false
+        ))
+        model.handle(event: runtimeEvent(
+            type: "tool_proposed",
+            turnID: "turn-1",
+            toolCallID: "tool-1",
+            toolName: "execute_script",
+            toolSummary: "Inspect Finder",
+            toolArguments: ["script_content": .string("return system info")],
+            safetyClass: SafetyClass.readOnly.rawValue,
+            approvalState: ApprovalState.notRequired.rawValue,
+            executionState: ExecutionState.proposed.rawValue
+        ))
+        model.handle(event: runtimeEvent(
+            type: "assistant_delta",
+            turnID: "turn-1",
+            text: "Here is the result.",
+            assistantSegmentID: "segment-2",
+            isFinalSegment: true
+        ))
+
+        let itemKinds = model.conversation.map { item -> String in
+            switch item {
+            case .assistantMessage:
+                return "assistant"
+            case .toolInvocation:
+                return "tool"
+            default:
+                return "other"
+            }
+        }
+        let assistantMessages = model.conversation.compactMap { item -> AssistantMessage? in
+            guard case .assistantMessage(let message) = item else { return nil }
+            return message
+        }
+
+        #expect(itemKinds == ["assistant", "tool", "assistant"])
+        #expect(assistantMessages.map(\.segmentID) == ["segment-1", "segment-2"])
+        #expect(assistantMessages.map(\.isFinalSegment) == [false, true])
+    }
+
+    @Test
+    @MainActor
+    func rerunHistoryIncludesOnlyFinalAssistantSegment() throws {
+        let runtime = FakeRuntimeClient()
+        let model = AppModel(runtime: runtime)
+
+        model.composerText = "First turn"
+        model.sendTextMessage()
+        let firstTurnID = try #require(model.conversation.compactMap { item -> UserMessage? in
+            guard case .userMessage(let message) = item else { return nil }
+            return message
+        }.last?.turnID)
+        model.handle(event: runtimeEvent(
+            type: "assistant_delta",
+            turnID: firstTurnID,
+            text: "Thinking aloud",
+            assistantSegmentID: "segment-intermediate",
+            isFinalSegment: false
+        ))
+        model.handle(event: runtimeEvent(
+            type: "assistant_delta",
+            turnID: firstTurnID,
+            text: "Final answer",
+            assistantSegmentID: "segment-final",
+            isFinalSegment: true
+        ))
+        model.handle(event: runtimeEvent(
+            type: "turn_finished",
+            turnID: firstTurnID,
+            status: "finished",
+            isFinal: true
+        ))
+
+        model.composerText = "Second turn"
+        model.sendTextMessage()
+        let secondMessage = try #require(model.conversation.compactMap { item -> UserMessage? in
+            guard case .userMessage(let message) = item else { return nil }
+            return message
+        }.last)
+        model.handle(event: runtimeEvent(
+            type: "turn_finished",
+            turnID: secondMessage.turnID,
+            status: "finished",
+            isFinal: true
+        ))
+
+        model.editUserMessage(secondMessage, newText: "Second turn updated")
+
+        let replaceHistoryCommand = try #require(runtime.sentCommands.first(where: { $0.type == "replace_history" }))
+        #expect(replaceHistoryCommand.history?.count == 2)
+        #expect(replaceHistoryCommand.history?[0].text == "First turn")
+        #expect(replaceHistoryCommand.history?[1].text == "Final answer")
+    }
+
+    @Test
+    @MainActor
+    func replySpeechStartsOnlyAfterFinalAssistantSegment() throws {
+        let runtime = FakeRuntimeClient()
+        let playbackService = FakeAudioPlaybackService()
+        let model = AppModel(runtime: runtime, playbackService: playbackService)
+        model.composerText = "Speak the answer"
+        model.sendTextMessage()
+
+        let turnID = try #require(model.conversation.compactMap { item -> UserMessage? in
+            guard case .userMessage(let message) = item else { return nil }
+            return message
+        }.last?.turnID)
+
+        model.handle(event: runtimeEvent(
+            type: "assistant_delta",
+            turnID: turnID,
+            text: "Checking something first…",
+            assistantSegmentID: "segment-1",
+            isFinalSegment: false
+        ))
+        model.handle(event: runtimeEvent(
+            type: "audio_chunk",
+            turnID: turnID,
+            chunkBase64: Data([0x00, 0x01]).base64EncodedString(),
+            sampleRate: 24_000,
+            channels: 1,
+            audioEncoding: "pcm_s16le"
+        ))
+
+        #expect(model.isReplySpeechActive == false)
+
+        model.handle(event: runtimeEvent(
+            type: "assistant_delta",
+            turnID: turnID,
+            text: "Done.",
+            assistantSegmentID: "segment-2",
+            isFinalSegment: true
+        ))
+        model.handle(event: runtimeEvent(
+            type: "audio_chunk",
+            turnID: turnID,
+            chunkBase64: Data([0x02, 0x03]).base64EncodedString(),
+            sampleRate: 24_000,
+            channels: 1,
+            audioEncoding: "pcm_s16le"
+        ))
+
+        #expect(model.isReplySpeechActive)
+        #expect(model.statusText == "Speaking…")
+    }
+
+    @Test
     func suppressesBenignRuntimeNoise() {
         #expect(AgentRuntimeClient.shouldSuppressRuntimeLog("Loaded Mistral tokenizer from /tmp/tekken.json"))
         #expect(AgentRuntimeClient.shouldSuppressRuntimeLog("Resolving dependencies"))
@@ -259,6 +416,314 @@ struct MacAssistantTests {
         #expect(firstBuffer === buffer)
         #expect(secondStatus == .noDataNow)
         #expect(secondBuffer == nil)
+    }
+
+    @Test
+    func serviceStartsCaptureUsingRequestedInputDeviceUID() throws {
+        let builtInMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 101,
+            uid: "built-in-mic",
+            name: "MacBook Pro Microphone",
+            transport: .builtIn
+        )
+        let airPodsMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 202,
+            uid: "airpods-mic",
+            name: "My AirPods Pro",
+            transport: .bluetooth
+        )
+        let controllerFactory = FakeCaptureControllerFactory()
+        let controller = FakeCaptureController(
+            resolvedInputDeviceUID: airPodsMicrophone.uid,
+            resolvedInputDeviceName: airPodsMicrophone.name
+        )
+        controllerFactory.queuedControllers = [controller]
+        let logs = LockedLogMessages()
+        let started = LockedCounter()
+        let service = MicrophoneCaptureService(
+            authorizationStatusProvider: { .authorized },
+            requestAccessHandler: { true },
+            availableInputDevicesProvider: { [builtInMicrophone, airPodsMicrophone] },
+            defaultInputDeviceProvider: { builtInMicrophone },
+            captureControllerFactory: controllerFactory
+        )
+
+        try service.start(
+            preferredInputDeviceUID: airPodsMicrophone.uid,
+            onStarted: { started.increment() },
+            onFirstInputBuffer: nil,
+            onFirstChunk: nil,
+            onError: nil,
+            logHandler: { logs.append($0) },
+            chunkHandler: { _ in }
+        )
+
+        #expect(controllerFactory.requestedInputDeviceUIDs == [airPodsMicrophone.uid])
+        #expect(started.value == 1)
+        #expect(logs.contains("Capture session started device=My AirPods Pro [airpods-mic]"))
+        service.stop()
+        #expect(controller.stopCallCount == 1)
+    }
+
+    @Test
+    func serviceFallsBackCleanlyWhenPreferredUIDIsUnavailable() throws {
+        let builtInMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 101,
+            uid: "built-in-mic",
+            name: "MacBook Pro Microphone",
+            transport: .builtIn
+        )
+        let controllerFactory = FakeCaptureControllerFactory()
+        let controller = FakeCaptureController(
+            resolvedInputDeviceUID: builtInMicrophone.uid,
+            resolvedInputDeviceName: builtInMicrophone.name
+        )
+        controllerFactory.queuedControllers = [controller]
+        let logs = LockedLogMessages()
+        let service = MicrophoneCaptureService(
+            authorizationStatusProvider: { .authorized },
+            requestAccessHandler: { true },
+            availableInputDevicesProvider: { [builtInMicrophone] },
+            defaultInputDeviceProvider: { builtInMicrophone },
+            captureControllerFactory: controllerFactory
+        )
+
+        try service.start(
+            preferredInputDeviceUID: "missing-mic",
+            onStarted: nil,
+            onFirstInputBuffer: nil,
+            onFirstChunk: nil,
+            onError: nil,
+            logHandler: { logs.append($0) },
+            chunkHandler: { _ in }
+        )
+
+        #expect(controllerFactory.requestedInputDeviceUIDs == [nil])
+        #expect(logs.contains("Requested input device uid=missing-mic is unavailable. Falling back to the active system route."))
+        #expect(logs.contains("Capture session started device=MacBook Pro Microphone [built-in-mic]"))
+        service.stop()
+    }
+
+    @Test
+    func serviceEmitsStartedAndFirstBufferCallbacksExactlyOnce() throws {
+        let builtInMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 101,
+            uid: "built-in-mic",
+            name: "MacBook Pro Microphone",
+            transport: .builtIn
+        )
+        let controllerFactory = FakeCaptureControllerFactory()
+        let controller = FakeCaptureController(
+            resolvedInputDeviceUID: builtInMicrophone.uid,
+            resolvedInputDeviceName: builtInMicrophone.name
+        )
+        controllerFactory.queuedControllers = [controller]
+        let started = LockedCounter()
+        let firstInputBuffer = LockedCounter()
+        let firstChunk = LockedCounter()
+        let chunkRecorder = LockedChunkRecorder()
+        let service = MicrophoneCaptureService(
+            authorizationStatusProvider: { .authorized },
+            requestAccessHandler: { true },
+            availableInputDevicesProvider: { [builtInMicrophone] },
+            defaultInputDeviceProvider: { builtInMicrophone },
+            captureControllerFactory: controllerFactory
+        )
+
+        try service.start(
+            preferredInputDeviceUID: builtInMicrophone.uid,
+            onStarted: { started.increment() },
+            onFirstInputBuffer: { firstInputBuffer.increment() },
+            onFirstChunk: { firstChunk.increment() },
+            onError: nil,
+            logHandler: nil,
+            chunkHandler: { chunkRecorder.append($0) }
+        )
+
+        controller.emit(buffer: makeFloatPCMBuffer(sampleRate: 48_000, frameCount: 4_800))
+        controller.emit(buffer: makeFloatPCMBuffer(sampleRate: 48_000, frameCount: 4_800))
+
+        #expect(started.value == 1)
+        #expect(firstInputBuffer.value == 1)
+        #expect(firstChunk.value == 1)
+        #expect(chunkRecorder.chunks.count == 2)
+        service.stop()
+    }
+
+    @Test
+    func serviceConverts24kAnd48kMonoInputTo16kInt16Chunks() throws {
+        let builtInMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 101,
+            uid: "built-in-mic",
+            name: "MacBook Pro Microphone",
+            transport: .builtIn
+        )
+        let controllerFactory = FakeCaptureControllerFactory()
+        let firstController = FakeCaptureController(
+            resolvedInputDeviceUID: builtInMicrophone.uid,
+            resolvedInputDeviceName: builtInMicrophone.name
+        )
+        let secondController = FakeCaptureController(
+            resolvedInputDeviceUID: builtInMicrophone.uid,
+            resolvedInputDeviceName: builtInMicrophone.name
+        )
+        controllerFactory.queuedControllers = [firstController, secondController]
+        let chunkRecorder = LockedChunkRecorder()
+        let service = MicrophoneCaptureService(
+            authorizationStatusProvider: { .authorized },
+            requestAccessHandler: { true },
+            availableInputDevicesProvider: { [builtInMicrophone] },
+            defaultInputDeviceProvider: { builtInMicrophone },
+            captureControllerFactory: controllerFactory
+        )
+
+        try service.start(
+            preferredInputDeviceUID: builtInMicrophone.uid,
+            onStarted: nil,
+            onFirstInputBuffer: nil,
+            onFirstChunk: nil,
+            onError: nil,
+            logHandler: nil,
+            chunkHandler: { chunkRecorder.append($0) }
+        )
+        firstController.emit(buffer: makeFloatPCMBuffer(sampleRate: 24_000, frameCount: 2_400))
+        service.stop()
+
+        try service.start(
+            preferredInputDeviceUID: builtInMicrophone.uid,
+            onStarted: nil,
+            onFirstInputBuffer: nil,
+            onFirstChunk: nil,
+            onError: nil,
+            logHandler: nil,
+            chunkHandler: { chunkRecorder.append($0) }
+        )
+        secondController.emit(buffer: makeFloatPCMBuffer(sampleRate: 48_000, frameCount: 4_800))
+        service.stop()
+
+        let chunks = chunkRecorder.chunks
+        #expect(chunks.count == 2)
+        #expect(chunks.allSatisfy { $0.sampleRate == 16_000 && $0.channels == 1 })
+        let firstDuration = Double(chunks[0].data.count / MemoryLayout<Int16>.size) / 16_000
+        let secondDuration = Double(chunks[1].data.count / MemoryLayout<Int16>.size) / 16_000
+        #expect(abs(firstDuration - 0.1) < 0.02)
+        #expect(abs(secondDuration - 0.1) < 0.02)
+    }
+
+    @Test
+    func serviceForwardsRuntimeErrorsAndCanRestartAfterStop() throws {
+        let builtInMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 101,
+            uid: "built-in-mic",
+            name: "MacBook Pro Microphone",
+            transport: .builtIn
+        )
+        let controllerFactory = FakeCaptureControllerFactory()
+        let firstController = FakeCaptureController(
+            resolvedInputDeviceUID: builtInMicrophone.uid,
+            resolvedInputDeviceName: builtInMicrophone.name
+        )
+        let secondController = FakeCaptureController(
+            resolvedInputDeviceUID: builtInMicrophone.uid,
+            resolvedInputDeviceName: builtInMicrophone.name
+        )
+        controllerFactory.queuedControllers = [firstController, secondController]
+        let errors = LockedLogMessages()
+        let service = MicrophoneCaptureService(
+            authorizationStatusProvider: { .authorized },
+            requestAccessHandler: { true },
+            availableInputDevicesProvider: { [builtInMicrophone] },
+            defaultInputDeviceProvider: { builtInMicrophone },
+            captureControllerFactory: controllerFactory
+        )
+
+        try service.start(
+            preferredInputDeviceUID: builtInMicrophone.uid,
+            onStarted: nil,
+            onFirstInputBuffer: nil,
+            onFirstChunk: nil,
+            onError: { errors.append($0.localizedDescription) },
+            logHandler: nil,
+            chunkHandler: { _ in }
+        )
+
+        firstController.emitError(NSError(
+            domain: "MacAssistantTests.Microphone",
+            code: 99,
+            userInfo: [NSLocalizedDescriptionKey: "Session interrupted."]
+        ))
+        #expect(errors.contains("Session interrupted."))
+
+        service.stop()
+        #expect(firstController.stopCallCount == 1)
+
+        try service.start(
+            preferredInputDeviceUID: builtInMicrophone.uid,
+            onStarted: nil,
+            onFirstInputBuffer: nil,
+            onFirstChunk: nil,
+            onError: nil,
+            logHandler: nil,
+            chunkHandler: { _ in }
+        )
+
+        #expect(secondController.startCallCount == 1)
+        service.stop()
+        #expect(secondController.stopCallCount == 1)
+    }
+
+    @Test
+    func serviceLogsBackendBannerAndRouteSummary() throws {
+        MicrophoneCaptureService.resetBackendBannerForTesting()
+        let builtInMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 101,
+            uid: "built-in-mic",
+            name: "MacBook Pro Microphone",
+            transport: .builtIn
+        )
+        let airPodsOutput = MicrophoneRouteCoordinator.OutputDevice(
+            deviceID: 301,
+            uid: "airpods-output",
+            name: "My AirPods Pro",
+            transport: .bluetooth
+        )
+        let controllerFactory = FakeCaptureControllerFactory()
+        let controller = FakeCaptureController(
+            resolvedInputDeviceUID: builtInMicrophone.uid,
+            resolvedInputDeviceName: builtInMicrophone.name
+        )
+        controllerFactory.queuedControllers = [controller]
+        let logs = LockedLogMessages()
+        let service = MicrophoneCaptureService(
+            authorizationStatusProvider: { .authorized },
+            requestAccessHandler: { true },
+            availableInputDevicesProvider: { [builtInMicrophone] },
+            defaultInputDeviceProvider: { builtInMicrophone },
+            routeStateProvider: {
+                .init(defaultOutputDevice: airPodsOutput, isArbitrationActive: true)
+            },
+            buildInfoProvider: {
+                (version: "test-version", build: "test-build")
+            },
+            captureControllerFactory: controllerFactory
+        )
+
+        try service.start(
+            preferredInputDeviceUID: builtInMicrophone.uid,
+            onStarted: nil,
+            onFirstInputBuffer: nil,
+            onFirstChunk: nil,
+            onError: nil,
+            logHandler: { logs.append($0) },
+            chunkHandler: { _ in }
+        )
+
+        #expect(logs.contains("[Mic] backend=avcapture version=test-version build=test-build"))
+        #expect(logs.contains("Capture session started device=MacBook Pro Microphone [built-in-mic]"))
+        #expect(logs.contains("defaultInput=MacBook Pro Microphone [built-in-mic]"))
+        #expect(logs.contains("defaultOutput=My AirPods Pro [airpods-output]"))
+        #expect(logs.contains("splitRouteArbitration=engaged"))
+        service.stop()
     }
 
     @Test
@@ -471,7 +936,7 @@ struct MacAssistantTests {
 
     @Test
     @MainActor
-    func startingVoiceTurnCreatesDraftBubbleAndWaitsForFirstChunkBeforeOpeningRuntime() {
+    func startingVoiceTurnCreatesDraftBubbleAndWaitsForFirstChunkBeforeOpeningRuntime() async {
         let microphoneService = FakeMicrophoneCaptureService()
         let runtime = FakeRuntimeClient()
         let model = AppModel(runtime: runtime, microphoneService: microphoneService)
@@ -479,6 +944,7 @@ struct MacAssistantTests {
         model.composerText = "Typed draft"
 
         model.startRecording()
+        await settleVoiceCallbacks()
 
         guard case .userVoiceDraft(let draft)? = model.conversation.last else {
             Issue.record("Expected a voice draft to be added to the conversation.")
@@ -557,6 +1023,7 @@ struct MacAssistantTests {
         model.isMicReady = true
 
         model.startRecording()
+        await settleVoiceCallbacks()
         let turnID = try #require(currentVoiceDraft(in: model)?.turnID)
         microphoneService.emitChunk()
         await settleVoiceCallbacks()
@@ -578,6 +1045,7 @@ struct MacAssistantTests {
         model.isMicReady = true
 
         model.startRecording()
+        await settleVoiceCallbacks()
         let turnID = try #require(currentVoiceDraft(in: model)?.turnID)
         microphoneService.emitChunk()
         await settleVoiceCallbacks()
@@ -638,6 +1106,7 @@ struct MacAssistantTests {
         model.isMicReady = true
 
         model.startRecording()
+        await settleVoiceCallbacks()
         let firstTurnID = try #require(currentVoiceDraft(in: model)?.turnID)
         microphoneService.emitChunk()
         await settleVoiceCallbacks()
@@ -653,6 +1122,7 @@ struct MacAssistantTests {
         #expect(microphoneService.stopCallCount >= 1)
 
         model.startRecording()
+        await settleVoiceCallbacks()
 
         #expect(microphoneService.startCallCount == 2)
         #expect(currentVoiceDraft(in: model)?.turnID != firstTurnID)
@@ -685,6 +1155,7 @@ struct MacAssistantTests {
         #expect(model.isRecording == false)
 
         model.startRecording()
+        await settleVoiceCallbacks()
 
         #expect(microphoneService.startCallCount == 2)
         #expect(currentVoiceDraft(in: model)?.turnID != firstTurnID)
@@ -728,6 +1199,7 @@ struct MacAssistantTests {
         model.isMicReady = true
 
         model.startRecording()
+        await settleVoiceCallbacks()
         let turnID = try #require(currentVoiceDraft(in: model)?.turnID)
         microphoneService.emitChunk()
         await settleVoiceCallbacks()
@@ -756,6 +1228,7 @@ struct MacAssistantTests {
         model.isMicReady = true
 
         model.startRecording()
+        await settleVoiceCallbacks()
         let firstTurnID = try #require(currentVoiceDraft(in: model)?.turnID)
         microphoneService.emitError(NSError(
             domain: "MacAssistantTests.Microphone",
@@ -770,6 +1243,7 @@ struct MacAssistantTests {
         #expect(model.isRecording == false)
 
         model.startRecording()
+        await settleVoiceCallbacks()
 
         #expect(microphoneService.startCallCount == 2)
         #expect(currentVoiceDraft(in: model)?.turnID != firstTurnID)
@@ -794,6 +1268,7 @@ struct MacAssistantTests {
         model.isMicReady = true
 
         model.startRecording()
+        await settleVoiceCallbacks()
         let turnID = try #require(currentVoiceDraft(in: model)?.turnID)
 
         #expect(microphoneService.startCallCount == 1)
@@ -829,6 +1304,7 @@ struct MacAssistantTests {
         model.isMicReady = true
 
         model.startRecording()
+        await settleVoiceCallbacks()
         let turnID = try #require(currentVoiceDraft(in: model)?.turnID)
 
         try? await Task.sleep(for: .milliseconds(30))
@@ -860,6 +1336,7 @@ struct MacAssistantTests {
         model.isMicReady = true
 
         model.startRecording()
+        await settleVoiceCallbacks()
         let turnID = try #require(currentVoiceDraft(in: model)?.turnID)
         #expect(microphoneService.startCallCount == 1)
 
@@ -876,12 +1353,267 @@ struct MacAssistantTests {
 
     @Test
     @MainActor
+    func splitRoutePreflightEngagesForBuiltInMicWhileBluetoothOutputIsActive() async throws {
+        let microphoneService = FakeMicrophoneCaptureService()
+        let routeCoordinator = FakeMicrophoneRouteCoordinator()
+        let runtime = FakeRuntimeClient()
+        let builtInMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 101,
+            uid: "built-in-mic",
+            name: "MacBook Pro Microphone",
+            transport: .builtIn
+        )
+        let airPodsOutput = MicrophoneRouteCoordinator.OutputDevice(
+            deviceID: 301,
+            uid: "airpods-output",
+            name: "My AirPods Pro",
+            transport: .bluetooth
+        )
+        microphoneService.inputDevices = [builtInMicrophone]
+        microphoneService.defaultInputDeviceUID = builtInMicrophone.uid
+        routeCoordinator.defaultOutputDevice = airPodsOutput
+        routeCoordinator.preflightResults = [
+            .success(.init(defaultOutputDevice: airPodsOutput, didEngageArbitration: true))
+        ]
+        let model = AppModel(
+            runtime: runtime,
+            microphoneService: microphoneService,
+            microphoneRouteCoordinator: routeCoordinator
+        )
+        model.isMicReady = true
+        model.refreshAvailableInputDevices()
+
+        model.startRecording()
+        await settleVoiceCallbacks()
+
+        #expect(routeCoordinator.prepareCallCount == 1)
+        #expect(routeCoordinator.preparedInputDevices == [builtInMicrophone])
+        #expect(microphoneService.startCallCount == 1)
+        #expect(model.isRecording)
+        #expect(currentVoiceDraft(in: model) != nil)
+        #expect(systemStatuses(in: model).isEmpty)
+        #expect(model.runtimeLogsText.contains("[Mic] Split-route preflight engaged"))
+    }
+
+    @Test
+    @MainActor
+    func retryableSplitRoutePreflightFailureRetriesSilentlyAndKeepsVoiceDraft() async throws {
+        let microphoneService = FakeMicrophoneCaptureService()
+        let routeCoordinator = FakeMicrophoneRouteCoordinator()
+        let runtime = FakeRuntimeClient()
+        let builtInMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 101,
+            uid: "built-in-mic",
+            name: "MacBook Pro Microphone",
+            transport: .builtIn
+        )
+        let airPodsOutput = MicrophoneRouteCoordinator.OutputDevice(
+            deviceID: 301,
+            uid: "airpods-output",
+            name: "My AirPods Pro",
+            transport: .bluetooth
+        )
+        microphoneService.inputDevices = [builtInMicrophone]
+        microphoneService.defaultInputDeviceUID = builtInMicrophone.uid
+        routeCoordinator.defaultOutputDevice = airPodsOutput
+        routeCoordinator.preflightResults = [
+            .failure(MicrophoneRouteCoordinator.PreflightError.arbitrationFailed(message: "Route arbitration failed.")),
+            .success(.init(defaultOutputDevice: airPodsOutput, didEngageArbitration: true))
+        ]
+        let model = AppModel(
+            runtime: runtime,
+            microphoneService: microphoneService,
+            microphoneRouteCoordinator: routeCoordinator,
+            microphoneStartRetryDelay: .milliseconds(10)
+        )
+        model.isMicReady = true
+        model.refreshAvailableInputDevices()
+
+        model.startRecording()
+        await settleVoiceCallbacks()
+        let turnID = try #require(currentVoiceDraft(in: model)?.turnID)
+
+        #expect(microphoneService.startCallCount == 0)
+        #expect(currentVoiceDraft(in: model)?.turnID == turnID)
+        #expect(systemStatuses(in: model).isEmpty)
+
+        try? await Task.sleep(for: .milliseconds(30))
+        await settleVoiceCallbacks()
+
+        #expect(routeCoordinator.prepareCallCount == 2)
+        #expect(microphoneService.startCallCount == 1)
+        #expect(currentVoiceDraft(in: model)?.turnID == turnID)
+        #expect(model.isRecording)
+        #expect(systemStatuses(in: model).isEmpty)
+    }
+
+    @Test
+    @MainActor
+    func repeatedRetryableSplitRoutePreflightFailureSurfacesErrorOnce() async throws {
+        let microphoneService = FakeMicrophoneCaptureService()
+        let routeCoordinator = FakeMicrophoneRouteCoordinator()
+        let runtime = FakeRuntimeClient()
+        let builtInMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 101,
+            uid: "built-in-mic",
+            name: "MacBook Pro Microphone",
+            transport: .builtIn
+        )
+        let airPodsOutput = MicrophoneRouteCoordinator.OutputDevice(
+            deviceID: 301,
+            uid: "airpods-output",
+            name: "My AirPods Pro",
+            transport: .bluetooth
+        )
+        microphoneService.inputDevices = [builtInMicrophone]
+        microphoneService.defaultInputDeviceUID = builtInMicrophone.uid
+        routeCoordinator.defaultOutputDevice = airPodsOutput
+        routeCoordinator.preflightResults = [
+            .failure(MicrophoneRouteCoordinator.PreflightError.arbitrationFailed(message: "Route arbitration failed.")),
+            .failure(MicrophoneRouteCoordinator.PreflightError.arbitrationFailed(message: "Route arbitration failed."))
+        ]
+        let model = AppModel(
+            runtime: runtime,
+            microphoneService: microphoneService,
+            microphoneRouteCoordinator: routeCoordinator,
+            microphoneStartRetryDelay: .milliseconds(10)
+        )
+        model.isMicReady = true
+        model.refreshAvailableInputDevices()
+
+        model.startRecording()
+        let turnID = try #require(currentVoiceDraft(in: model)?.turnID)
+        await settleVoiceCallbacks()
+        try? await Task.sleep(for: .milliseconds(30))
+        await settleVoiceCallbacks()
+
+        #expect(routeCoordinator.prepareCallCount == 2)
+        #expect(microphoneService.startCallCount == 0)
+        #expect(currentVoiceDraft(in: model) == nil)
+        #expect(userMessage(for: turnID, in: model) == nil)
+        #expect(model.statusText == "Route arbitration failed.")
+        #expect(systemStatuses(in: model).map(\.text) == ["Route arbitration failed."])
+    }
+
+    @Test
+    @MainActor
+    func discardingVoiceDraftCancelsPendingSplitRoutePreflight() async throws {
+        let microphoneService = FakeMicrophoneCaptureService()
+        let routeCoordinator = FakeMicrophoneRouteCoordinator()
+        let runtime = FakeRuntimeClient()
+        let builtInMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 101,
+            uid: "built-in-mic",
+            name: "MacBook Pro Microphone",
+            transport: .builtIn
+        )
+        routeCoordinator.defaultOutputDevice = MicrophoneRouteCoordinator.OutputDevice(
+            deviceID: 301,
+            uid: "airpods-output",
+            name: "My AirPods Pro",
+            transport: .bluetooth
+        )
+        routeCoordinator.holdsPreparationOpen = true
+        microphoneService.inputDevices = [builtInMicrophone]
+        microphoneService.defaultInputDeviceUID = builtInMicrophone.uid
+        let model = AppModel(
+            runtime: runtime,
+            microphoneService: microphoneService,
+            microphoneRouteCoordinator: routeCoordinator
+        )
+        model.isMicReady = true
+        model.refreshAvailableInputDevices()
+
+        model.startRecording()
+        await settleVoiceCallbacks()
+        let turnID = try #require(currentVoiceDraft(in: model)?.turnID)
+
+        #expect(microphoneService.startCallCount == 0)
+        model.discardCurrentInput()
+        try? await Task.sleep(for: .milliseconds(30))
+        await settleVoiceCallbacks()
+
+        #expect(routeCoordinator.cancelPendingPreparationCallCount >= 1)
+        #expect(microphoneService.startCallCount == 0)
+        #expect(currentVoiceDraft(in: model) == nil)
+        #expect(userMessage(for: turnID, in: model) == nil)
+        #expect(systemStatuses(in: model).isEmpty)
+        #expect(model.statusText == "Ready")
+    }
+
+    @Test
+    @MainActor
+    func bluetoothInputSkipsSplitRoutePreflightArbitration() async {
+        let microphoneService = FakeMicrophoneCaptureService()
+        let routeCoordinator = FakeMicrophoneRouteCoordinator()
+        let runtime = FakeRuntimeClient()
+        let builtInMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 101,
+            uid: "built-in-mic",
+            name: "MacBook Pro Microphone",
+            transport: .builtIn
+        )
+        let airPodsMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 202,
+            uid: "airpods-mic",
+            name: "My AirPods Pro",
+            transport: .bluetooth
+        )
+        routeCoordinator.defaultOutputDevice = MicrophoneRouteCoordinator.OutputDevice(
+            deviceID: 301,
+            uid: "airpods-output",
+            name: "My AirPods Pro",
+            transport: .bluetooth
+        )
+        microphoneService.inputDevices = [builtInMicrophone, airPodsMicrophone]
+        microphoneService.defaultInputDeviceUID = builtInMicrophone.uid
+        let model = AppModel(
+            runtime: runtime,
+            microphoneService: microphoneService,
+            microphoneRouteCoordinator: routeCoordinator
+        )
+        model.isMicReady = true
+        model.settings.inputDevicePreference = .specificDeviceUID(airPodsMicrophone.uid)
+        model.refreshAvailableInputDevices()
+
+        model.startRecording()
+        await settleVoiceCallbacks()
+
+        #expect(routeCoordinator.prepareCallCount == 1)
+        #expect(microphoneService.lastPreferredInputDeviceUID == airPodsMicrophone.uid)
+        #expect(model.runtimeLogsText.contains("[Mic] Split-route preflight skipped requestedInput=My AirPods Pro [airpods-mic]"))
+    }
+
+    @Test
+    @MainActor
     func microphoneDiagnosticsAppearInDebugLogs() async {
         let microphoneService = FakeMicrophoneCaptureService()
+        let routeCoordinator = FakeMicrophoneRouteCoordinator()
+        let builtInMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 101,
+            uid: "built-in-mic",
+            name: "MacBook Pro Microphone",
+            transport: .builtIn
+        )
+        microphoneService.inputDevices = [builtInMicrophone]
+        microphoneService.defaultInputDeviceUID = builtInMicrophone.uid
+        routeCoordinator.defaultOutputDevice = MicrophoneRouteCoordinator.OutputDevice(
+            deviceID: 301,
+            uid: "airpods-output",
+            name: "My AirPods Pro",
+            transport: .bluetooth
+        )
+        routeCoordinator.preflightResults = [
+            .success(.init(
+                defaultOutputDevice: routeCoordinator.defaultOutputDevice,
+                didEngageArbitration: true
+            ))
+        ]
         let runtime = FakeRuntimeClient()
         let model = AppModel(
             runtime: runtime,
             microphoneService: microphoneService,
+            microphoneRouteCoordinator: routeCoordinator,
             voiceCaptureWaitingDelay: .milliseconds(10)
         )
         model.isMicReady = true
@@ -893,7 +1625,11 @@ struct MacAssistantTests {
         microphoneService.emitChunk()
         await settleVoiceCallbacks()
 
-        #expect(model.runtimeLogsText.contains("[Mic] Engine started"))
+        #expect(model.runtimeLogsText.contains("[Mic] backend=avcapture version=test build=test"))
+        #expect(model.runtimeLogsText.contains("[Mic] Starting capture"))
+        #expect(model.runtimeLogsText.contains("defaultOutput=My AirPods Pro [airpods-output]"))
+        #expect(model.runtimeLogsText.contains("[Mic] Split-route preflight engaged"))
+        #expect(model.runtimeLogsText.contains("[Mic] Capture session started"))
         #expect(model.runtimeLogsText.contains("[Mic] Waiting for microphone audio"))
         #expect(model.runtimeLogsText.contains("[Mic] First input buffer"))
         #expect(model.runtimeLogsText.contains("[Mic] First converted chunk"))
@@ -901,7 +1637,7 @@ struct MacAssistantTests {
 
     @Test
     @MainActor
-    func automaticInputDevicePreferencePrefersBuiltInMicrophoneOverAirPods() {
+    func automaticInputDevicePreferencePrefersBuiltInMicrophoneOverAirPods() async {
         let microphoneService = FakeMicrophoneCaptureService()
         let runtime = FakeRuntimeClient()
         let builtInMicrophone = MicrophoneCaptureService.InputDevice(
@@ -924,6 +1660,7 @@ struct MacAssistantTests {
         model.refreshAvailableInputDevices()
 
         model.startRecording()
+        await settleVoiceCallbacks()
 
         #expect(microphoneService.lastPreferredInputDeviceUID == builtInMicrophone.uid)
         #expect(model.runtimeLogsText.contains("resolved=MacBook Pro Microphone [built-in-mic]"))
@@ -931,7 +1668,7 @@ struct MacAssistantTests {
 
     @Test
     @MainActor
-    func explicitInputDevicePreferencePassesSelectedUIDToCaptureService() {
+    func explicitInputDevicePreferencePassesSelectedUIDToCaptureService() async {
         let microphoneService = FakeMicrophoneCaptureService()
         let runtime = FakeRuntimeClient()
         let builtInMicrophone = MicrophoneCaptureService.InputDevice(
@@ -955,6 +1692,7 @@ struct MacAssistantTests {
         model.refreshAvailableInputDevices()
 
         model.startRecording()
+        await settleVoiceCallbacks()
 
         #expect(microphoneService.lastPreferredInputDeviceUID == airPodsMicrophone.uid)
         #expect(model.runtimeLogsText.contains("specific My AirPods Pro [airpods-mic]"))
@@ -964,6 +1702,7 @@ struct MacAssistantTests {
     @MainActor
     func captureStartLogsSelectedInputDeviceAndFormat() async {
         let microphoneService = FakeMicrophoneCaptureService()
+        let routeCoordinator = FakeMicrophoneRouteCoordinator()
         let runtime = FakeRuntimeClient()
         let builtInMicrophone = MicrophoneCaptureService.InputDevice(
             deviceID: 101,
@@ -973,17 +1712,30 @@ struct MacAssistantTests {
         )
         microphoneService.inputDevices = [builtInMicrophone]
         microphoneService.defaultInputDeviceUID = builtInMicrophone.uid
+        routeCoordinator.defaultOutputDevice = MicrophoneRouteCoordinator.OutputDevice(
+            deviceID: 302,
+            uid: "built-in-output",
+            name: "MacBook Pro Speakers",
+            transport: .builtIn
+        )
 
-        let model = AppModel(runtime: runtime, microphoneService: microphoneService)
+        let model = AppModel(
+            runtime: runtime,
+            microphoneService: microphoneService,
+            microphoneRouteCoordinator: routeCoordinator
+        )
         model.isMicReady = true
         model.refreshAvailableInputDevices()
 
         model.startRecording()
         await settleVoiceCallbacks()
+        microphoneService.emitChunk()
+        await settleVoiceCallbacks()
 
-        #expect(model.runtimeLogsText.contains("[Mic] Starting capture preference=automatic (built-in preferred) resolved=MacBook Pro Microphone [built-in-mic]"))
-        #expect(model.runtimeLogsText.contains("[Mic] Engine started device=MacBook Pro Microphone [built-in-mic]"))
-        #expect(model.runtimeLogsText.contains("input=48000Hz/1ch/float32 output=16000Hz/1ch/int16"))
+        #expect(model.runtimeLogsText.contains("[Mic] Starting capture preference=automatic (built-in preferred) resolved=MacBook Pro Microphone [built-in-mic] defaultOutput=MacBook Pro Speakers [built-in-output]"))
+        #expect(model.runtimeLogsText.contains("[Mic] Split-route preflight skipped requestedInput=MacBook Pro Microphone [built-in-mic] defaultOutput=MacBook Pro Speakers [built-in-output]"))
+        #expect(model.runtimeLogsText.contains("[Mic] Capture session started device=MacBook Pro Microphone [built-in-mic]"))
+        #expect(model.runtimeLogsText.contains("[Mic] First converted chunk"))
     }
 
     @Test
@@ -1112,7 +1864,13 @@ struct MacAssistantTests {
             return message
         }.last?.turnID)
 
-        model.handle(event: runtimeEvent(type: "assistant_delta", turnID: turnID, text: "Hello there"))
+        model.handle(event: runtimeEvent(
+            type: "assistant_delta",
+            turnID: turnID,
+            text: "Hello there",
+            assistantSegmentID: "segment-final",
+            isFinalSegment: true
+        ))
         model.handle(event: runtimeEvent(
             type: "audio_chunk",
             turnID: turnID,
@@ -1161,6 +1919,13 @@ struct MacAssistantTests {
         }.last?.turnID)
 
         model.handle(event: runtimeEvent(
+            type: "assistant_delta",
+            turnID: turnID,
+            text: "Final answer",
+            assistantSegmentID: "segment-final",
+            isFinalSegment: true
+        ))
+        model.handle(event: runtimeEvent(
             type: "audio_chunk",
             turnID: turnID,
             chunkBase64: Data([0x10, 0x11]).base64EncodedString(),
@@ -1205,7 +1970,13 @@ struct MacAssistantTests {
             return message
         }.last?.turnID)
 
-        model.handle(event: runtimeEvent(type: "assistant_delta", turnID: turnID, text: "Finished answer"))
+        model.handle(event: runtimeEvent(
+            type: "assistant_delta",
+            turnID: turnID,
+            text: "Finished answer",
+            assistantSegmentID: "segment-final",
+            isFinalSegment: true
+        ))
         model.handle(event: runtimeEvent(
             type: "audio_chunk",
             turnID: turnID,
@@ -1310,6 +2081,7 @@ struct MacAssistantTests {
         message: String? = nil,
         stage: String? = nil,
         text: String? = nil,
+        assistantSegmentID: String? = nil,
         chunkBase64: String? = nil,
         sampleRate: Int? = nil,
         channels: Int? = nil,
@@ -1322,10 +2094,13 @@ struct MacAssistantTests {
         toolName: String? = nil,
         toolSummary: String? = nil,
         toolArguments: [String: JSONValue]? = nil,
+        safetyClass: String? = nil,
         approvalState: String? = nil,
         executionState: String? = nil,
+        output: String? = nil,
         status: String? = nil,
-        isFinal: Bool? = nil
+        isFinal: Bool? = nil,
+        isFinalSegment: Bool? = nil
     ) -> RuntimeEventEnvelope {
         RuntimeEventEnvelope(
             type: type,
@@ -1337,6 +2112,7 @@ struct MacAssistantTests {
             message: message,
             stage: stage,
             text: text,
+            assistantSegmentID: assistantSegmentID,
             progress: nil,
             bytesDownloaded: bytesDownloaded,
             bytesTotal: bytesTotal,
@@ -1350,12 +2126,13 @@ struct MacAssistantTests {
             toolName: toolName,
             toolSummary: toolSummary,
             toolArguments: toolArguments,
-            safetyClass: nil,
+            safetyClass: safetyClass,
             approvalState: approvalState,
             executionState: executionState,
-            output: nil,
+            output: output,
             status: status,
-            isFinal: isFinal
+            isFinal: isFinal,
+            isFinalSegment: isFinalSegment
         )
     }
 
@@ -1402,10 +2179,12 @@ struct MacAssistantTests {
 
     @MainActor
     private func assistantMessage(for turnID: String, in model: AppModel) -> AssistantMessage? {
-        model.conversation.compactMap { item -> AssistantMessage? in
-            guard case .assistantMessage(let message) = item, message.turnID == turnID else { return nil }
+        let messages = model.conversation.compactMap { item -> AssistantMessage? in
+            guard case .assistantMessage(let message) = item,
+                  message.turnID == turnID else { return nil }
             return message
-        }.last
+        }
+        return messages.last(where: \.isFinalSegment) ?? messages.last
     }
 
     @MainActor
@@ -1486,10 +2265,12 @@ private final class FakeMicrophoneCaptureService: MicrophoneCaptureServicing {
         if !startResults.isEmpty {
             let result = startResults.removeFirst()
             if case .failure(let error) = result {
+                logHandler?("[Mic] backend=avcapture version=test build=test")
                 logHandler?(
                     "[Mic] Failed to start capture requested=\(describe(device: inputDevices.first(where: { $0.uid == preferredInputDeviceUID }))) " +
                     "resolved=\(describe(device: lastStartedInputDevice)) " +
-                    "input=48000Hz/1ch/float32: \(error.localizedDescription)"
+                    "defaultInput=\(describe(device: defaultInputDevice())) " +
+                    "defaultOutput=system-default splitRouteArbitration=skipped: \(error.localizedDescription)"
                 )
                 throw error
             }
@@ -1500,10 +2281,12 @@ private final class FakeMicrophoneCaptureService: MicrophoneCaptureServicing {
         self.onError = onError
         self.logHandler = logHandler
         self.chunkHandler = chunkHandler
+        logHandler?("[Mic] backend=avcapture version=test build=test")
         logHandler?(
-            "[Mic] Engine started device=\(describe(device: lastStartedInputDevice)) " +
+            "[Mic] Capture session started device=\(describe(device: lastStartedInputDevice)) " +
             "requested=\(describe(device: inputDevices.first(where: { $0.uid == preferredInputDeviceUID }))) " +
-            "input=48000Hz/1ch/float32 output=16000Hz/1ch/int16"
+            "defaultInput=\(describe(device: defaultInputDevice())) " +
+            "defaultOutput=system-default splitRouteArbitration=skipped"
         )
         onStarted?()
     }
@@ -1553,6 +2336,227 @@ private final class FakeMicrophoneCaptureService: MicrophoneCaptureServicing {
         guard let device else { return "system-default" }
         return "\(device.name) [\(device.uid)]"
     }
+}
+
+private final class FakeMicrophoneRouteCoordinator: MicrophoneRouteCoordinating, @unchecked Sendable {
+    var defaultOutputDevice: MicrophoneRouteCoordinator.OutputDevice?
+    var preflightResults: [Result<MicrophoneRouteCoordinator.PreflightResult, Error>] = []
+    var holdsPreparationOpen = false
+    private(set) var prepareCallCount = 0
+    private(set) var cancelPendingPreparationCallCount = 0
+    private(set) var leaveRecordingRouteCallCount = 0
+    private(set) var preparedInputDevices: [MicrophoneCaptureService.InputDevice?] = []
+    private var pendingContinuations: [CheckedContinuation<MicrophoneRouteCoordinator.PreflightResult, Error>] = []
+    private var arbitrationActive = false
+
+    func prepareForRecording(inputDevice: MicrophoneCaptureService.InputDevice?) async throws -> MicrophoneRouteCoordinator.PreflightResult {
+        prepareCallCount += 1
+        preparedInputDevices.append(inputDevice)
+
+        if holdsPreparationOpen {
+            return try await withCheckedThrowingContinuation { continuation in
+                pendingContinuations.append(continuation)
+            }
+        }
+
+        if !preflightResults.isEmpty {
+            let result = preflightResults.removeFirst()
+            switch result {
+            case .success(let preflightResult):
+                defaultOutputDevice = preflightResult.defaultOutputDevice
+                arbitrationActive = preflightResult.didEngageArbitration
+                return preflightResult
+            case .failure(let error):
+                throw error
+            }
+        }
+
+        arbitrationActive = false
+        return MicrophoneRouteCoordinator.PreflightResult(
+            defaultOutputDevice: defaultOutputDevice,
+            didEngageArbitration: false
+        )
+    }
+
+    func cancelPendingPreparation() {
+        cancelPendingPreparationCallCount += 1
+        let continuations = pendingContinuations
+        pendingContinuations.removeAll(keepingCapacity: false)
+        continuations.forEach { $0.resume(throwing: CancellationError()) }
+    }
+
+    func leaveRecordingRoute() {
+        leaveRecordingRouteCallCount += 1
+        arbitrationActive = false
+    }
+
+    func routeStateSnapshot() -> MicrophoneRouteCoordinator.RouteState {
+        MicrophoneRouteCoordinator.RouteState(
+            defaultOutputDevice: defaultOutputDevice,
+            isArbitrationActive: arbitrationActive
+        )
+    }
+
+    func resolvePendingPreparation(with result: Result<MicrophoneRouteCoordinator.PreflightResult, Error>) {
+        let continuations = pendingContinuations
+        pendingContinuations.removeAll(keepingCapacity: false)
+        switch result {
+        case .success(let preflightResult):
+            defaultOutputDevice = preflightResult.defaultOutputDevice
+            arbitrationActive = preflightResult.didEngageArbitration
+        case .failure:
+            arbitrationActive = false
+        }
+        continuations.forEach { continuation in
+            switch result {
+            case .success(let preflightResult):
+                continuation.resume(returning: preflightResult)
+            case .failure(let error):
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+}
+
+private final class FakeCaptureControllerFactory: MicrophoneCaptureControllerFactory, @unchecked Sendable {
+    var queuedControllers: [FakeCaptureController] = []
+    private(set) var requestedInputDeviceUIDs: [String?] = []
+
+    func makeController(
+        preferredInputDeviceUID: String?,
+        onPCMBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void,
+        onError: @escaping @Sendable (Error) -> Void
+    ) throws -> any MicrophoneCaptureControlling {
+        guard !queuedControllers.isEmpty else {
+            throw NSError(
+                domain: "MacAssistantTests.Microphone",
+                code: 500,
+                userInfo: [NSLocalizedDescriptionKey: "No fake capture controller was queued."]
+            )
+        }
+
+        let controller = queuedControllers.removeFirst()
+        controller.requestedInputDeviceUID = preferredInputDeviceUID
+        controller.onPCMBuffer = onPCMBuffer
+        controller.onError = onError
+        requestedInputDeviceUIDs.append(preferredInputDeviceUID)
+        return controller
+    }
+}
+
+private final class FakeCaptureController: MicrophoneCaptureControlling, @unchecked Sendable {
+    var requestedInputDeviceUID: String?
+    let resolvedInputDeviceUID: String?
+    let resolvedInputDeviceName: String?
+    private(set) var startCallCount = 0
+    private(set) var stopCallCount = 0
+    var startError: Error?
+    var onPCMBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
+    var onError: (@Sendable (Error) -> Void)?
+
+    init(resolvedInputDeviceUID: String?, resolvedInputDeviceName: String?) {
+        self.resolvedInputDeviceUID = resolvedInputDeviceUID
+        self.resolvedInputDeviceName = resolvedInputDeviceName
+    }
+
+    func start() throws {
+        startCallCount += 1
+        if let startError {
+            throw startError
+        }
+    }
+
+    func stop() {
+        stopCallCount += 1
+    }
+
+    func emit(buffer: AVAudioPCMBuffer) {
+        onPCMBuffer?(buffer)
+    }
+
+    func emitError(_ error: Error) {
+        onError?(error)
+    }
+}
+
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = 0
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func increment() {
+        lock.lock()
+        storage += 1
+        lock.unlock()
+    }
+}
+
+private final class LockedLogMessages: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    var values: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func append(_ message: String) {
+        lock.lock()
+        storage.append(message)
+        lock.unlock()
+    }
+
+    func contains(_ fragment: String) -> Bool {
+        values.contains(where: { $0.contains(fragment) })
+    }
+}
+
+private final class LockedChunkRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [MicrophoneCaptureService.CaptureChunk] = []
+
+    var chunks: [MicrophoneCaptureService.CaptureChunk] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func append(_ chunk: MicrophoneCaptureService.CaptureChunk) {
+        lock.lock()
+        storage.append(chunk)
+        lock.unlock()
+    }
+}
+
+private func makeFloatPCMBuffer(
+    sampleRate: Double,
+    frameCount: AVAudioFrameCount,
+    channels: AVAudioChannelCount = 1
+) -> AVAudioPCMBuffer {
+    let format = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: sampleRate,
+        channels: channels,
+        interleaved: false
+    )!
+    let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount)!
+    buffer.frameLength = frameCount
+
+    if let floatChannelData = buffer.floatChannelData {
+        for channel in 0..<Int(channels) {
+            for frame in 0..<Int(frameCount) {
+                floatChannelData[channel][frame] = sin(Float(frame) * 0.05)
+            }
+        }
+    }
+
+    return buffer
 }
 
 @MainActor

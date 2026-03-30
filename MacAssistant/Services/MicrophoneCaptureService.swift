@@ -1,6 +1,7 @@
 @preconcurrency import AVFoundation
 import AudioToolbox
 import CoreAudio
+import CoreMedia
 import Foundation
 
 protocol MicrophoneCaptureServicing: AnyObject {
@@ -22,7 +23,24 @@ protocol MicrophoneCaptureServicing: AnyObject {
     func stop()
 }
 
-final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sendable {
+protocol MicrophoneCaptureControlling: AnyObject, Sendable {
+    var requestedInputDeviceUID: String? { get }
+    var resolvedInputDeviceUID: String? { get }
+    var resolvedInputDeviceName: String? { get }
+
+    func start() throws
+    func stop()
+}
+
+protocol MicrophoneCaptureControllerFactory: Sendable {
+    func makeController(
+        preferredInputDeviceUID: String?,
+        onPCMBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void,
+        onError: @escaping @Sendable (Error) -> Void
+    ) throws -> any MicrophoneCaptureControlling
+}
+
+final class MicrophoneCaptureService: NSObject, MicrophoneCaptureServicing, @unchecked Sendable {
     struct CaptureChunk: Sendable {
         let data: Data
         let sampleRate: Int
@@ -58,11 +76,17 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
     enum CaptureError: LocalizedError {
         case permissionDenied
         case missingInputFormat
-        case missingInputAudioUnit
+        case missingCaptureInputDevice
         case unableToBuildOutputFormat
         case unableToCreateConverter
         case unableToCreateConvertedBuffer
-        case unableToSelectInputDevice(name: String, status: OSStatus)
+        case unableToCreateCaptureInput(name: String)
+        case unableToAddCaptureInput(name: String)
+        case unableToAddCaptureOutput
+        case captureSessionFailedToStart
+        case captureSessionInterrupted(reason: String)
+        case unsupportedSampleBufferFormat
+        case unableToCreatePCMBuffer
 
         var errorDescription: String? {
             switch self {
@@ -70,16 +94,28 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
                 return "Microphone access is required to record voice input."
             case .missingInputFormat:
                 return "No microphone input format is available."
-            case .missingInputAudioUnit:
-                return "Unable to access the system microphone audio unit."
+            case .missingCaptureInputDevice:
+                return "No microphone input device is currently available."
             case .unableToBuildOutputFormat:
                 return "Unable to create the voice capture output format."
             case .unableToCreateConverter:
                 return "Unable to convert microphone audio into the speech input format."
             case .unableToCreateConvertedBuffer:
                 return "Unable to allocate the converted microphone audio buffer."
-            case .unableToSelectInputDevice(let name, let status):
-                return "Unable to select microphone input device “\(name)” (OSStatus \(status))."
+            case .unableToCreateCaptureInput(let name):
+                return "Unable to open microphone input device \"\(name)\"."
+            case .unableToAddCaptureInput(let name):
+                return "Unable to attach microphone input device \"\(name)\" to the capture session."
+            case .unableToAddCaptureOutput:
+                return "Unable to attach microphone capture output."
+            case .captureSessionFailedToStart:
+                return "Unable to start microphone capture."
+            case .captureSessionInterrupted(let reason):
+                return "Microphone capture was interrupted (\(reason))."
+            case .unsupportedSampleBufferFormat:
+                return "The microphone produced an unsupported audio format."
+            case .unableToCreatePCMBuffer:
+                return "Unable to read microphone audio samples."
             }
         }
     }
@@ -92,7 +128,16 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
 
     private let stateLock = NSLock()
     private let audioDeviceNotificationQueue = DispatchQueue(label: "MacAssistant.MicrophoneCaptureService.devices")
+    private let authorizationStatusProvider: @Sendable () -> AuthorizationStatus
+    private let requestAccessHandler: @Sendable () async -> Bool
+    private let availableInputDevicesProvider: @Sendable () -> [InputDevice]
+    private let defaultInputDeviceProvider: @Sendable () -> InputDevice?
+    private let routeStateProvider: @Sendable () -> MicrophoneRouteCoordinator.RouteState
+    private let buildInfoProvider: @Sendable () -> (version: String, build: String)
+    private let captureControllerFactory: any MicrophoneCaptureControllerFactory
     private var activeSession: CaptureSession?
+    private static let backendBannerLock = NSLock()
+    nonisolated(unsafe) private static var hasLoggedBackendBanner = false
 
     private lazy var devicesChangedListener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
         self?.onInputDevicesChanged?()
@@ -102,7 +147,47 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
         self?.onInputDevicesChanged?()
     }
 
-    init() {
+    init(
+        authorizationStatusProvider: @escaping @Sendable () -> AuthorizationStatus = {
+            switch AVCaptureDevice.authorizationStatus(for: .audio) {
+            case .authorized:
+                return .authorized
+            case .notDetermined:
+                return .notDetermined
+            case .denied, .restricted:
+                return .denied
+            @unknown default:
+                return .denied
+            }
+        },
+        requestAccessHandler: @escaping @Sendable () async -> Bool = {
+            await withCheckedContinuation { continuation in
+                AVCaptureDevice.requestAccess(for: .audio) { granted in
+                    continuation.resume(returning: granted)
+                }
+            }
+        },
+        availableInputDevicesProvider: @escaping @Sendable () -> [InputDevice] = { MicrophoneCaptureService.enumerateInputDevices() },
+        defaultInputDeviceProvider: @escaping @Sendable () -> InputDevice? = { MicrophoneCaptureService.resolveDefaultInputDevice() },
+        routeStateProvider: @escaping @Sendable () -> MicrophoneRouteCoordinator.RouteState = {
+            MicrophoneRouteCoordinator.shared.routeStateSnapshot()
+        },
+        buildInfoProvider: @escaping @Sendable () -> (version: String, build: String) = {
+            let infoDictionary = Bundle.main.infoDictionary ?? [:]
+            let version = infoDictionary["CFBundleShortVersionString"] as? String ?? "unknown"
+            let build = infoDictionary["CFBundleVersion"] as? String ?? "unknown"
+            return (version, build)
+        },
+        captureControllerFactory: any MicrophoneCaptureControllerFactory = AVFoundationMicrophoneCaptureControllerFactory()
+    ) {
+        self.authorizationStatusProvider = authorizationStatusProvider
+        self.requestAccessHandler = requestAccessHandler
+        self.availableInputDevicesProvider = availableInputDevicesProvider
+        self.defaultInputDeviceProvider = defaultInputDeviceProvider
+        self.routeStateProvider = routeStateProvider
+        self.buildInfoProvider = buildInfoProvider
+        self.captureControllerFactory = captureControllerFactory
+        super.init()
         installAudioDeviceListeners()
     }
 
@@ -111,16 +196,7 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
     }
 
     func authorizationStatus() -> AuthorizationStatus {
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:
-            return .authorized
-        case .notDetermined:
-            return .notDetermined
-        case .denied, .restricted:
-            return .denied
-        @unknown default:
-            return .denied
-        }
+        authorizationStatusProvider()
     }
 
     func requestAccess() async -> Bool {
@@ -132,20 +208,15 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
             return false
         }
 
-        return await withCheckedContinuation { continuation in
-            AVCaptureDevice.requestAccess(for: .audio) { granted in
-                continuation.resume(returning: granted)
-            }
-        }
+        return await requestAccessHandler()
     }
 
     func availableInputDevices() -> [InputDevice] {
-        Self.enumerateInputDevices()
+        availableInputDevicesProvider()
     }
 
     func defaultInputDevice() -> InputDevice? {
-        guard let defaultDeviceID = Self.defaultInputDeviceID() else { return nil }
-        return availableInputDevices().first(where: { $0.deviceID == defaultDeviceID })
+        defaultInputDeviceProvider()
     }
 
     func start(
@@ -162,8 +233,10 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
         }
         guard currentSession() == nil else { return }
 
-        let engine = AVAudioEngine()
-        let input = engine.inputNode
+        if let backendBanner = Self.backendBanner(buildInfoProvider: buildInfoProvider) {
+            logHandler?(backendBanner)
+        }
+
         let availableDevices = availableInputDevices()
         let requestedInputDevice = preferredInputDeviceUID.flatMap { uid in
             availableDevices.first(where: { $0.uid == uid })
@@ -172,14 +245,6 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
             logHandler?("[Mic] Requested input device uid=\(preferredInputDeviceUID) is unavailable. Falling back to the active system route.")
         }
 
-        if let requestedInputDevice {
-            try Self.selectInputDevice(requestedInputDevice, on: input)
-        }
-
-        let preStartInputFormat = input.outputFormat(forBus: 0)
-        guard preStartInputFormat.channelCount > 0 else {
-            throw CaptureError.missingInputFormat
-        }
         guard let outputFormat = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
             sampleRate: Self.targetSampleRate,
@@ -189,14 +254,17 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
             throw CaptureError.unableToBuildOutputFormat
         }
 
-        let resolvedInputDevice = Self.currentInputDevice(for: input, availableDevices: availableDevices)
-            ?? requestedInputDevice
-            ?? defaultInputDevice()
+        let currentDefaultInputDevice = defaultInputDevice()
+        let routeState = routeStateProvider()
+        let fallbackInputDevice = requestedInputDevice ?? currentDefaultInputDevice ?? availableDevices.first
         let session = CaptureSession(
-            engine: engine,
             outputFormat: outputFormat,
             requestedInputDevice: requestedInputDevice,
-            activeInputDevice: resolvedInputDevice,
+            defaultInputDevice: currentDefaultInputDevice,
+            defaultOutputDevice: routeState.defaultOutputDevice,
+            didEngageSplitRouteArbitration: routeState.isArbitrationActive,
+            resolvedInputDeviceUID: fallbackInputDevice?.uid,
+            resolvedInputDeviceName: fallbackInputDevice?.name,
             chunkHandler: chunkHandler,
             onStarted: onStarted,
             onFirstInputBuffer: onFirstInputBuffer,
@@ -204,48 +272,43 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
             onError: onError,
             logHandler: logHandler
         )
-        session.configurationObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: engine,
-            queue: nil
-        ) { [weak self] _ in
-            self?.handleConfigurationChange(for: session)
-        }
+
+        let controller = try captureControllerFactory.makeController(
+            preferredInputDeviceUID: requestedInputDevice?.uid,
+            onPCMBuffer: { [weak self] buffer in
+                self?.handlePCMBuffer(buffer, session: session)
+            },
+            onError: { [weak self] error in
+                self?.emitError(error, session: session)
+            }
+        )
+        session.controller = controller
         setSession(session)
 
-        input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: Self.tapBufferSize, format: nil) { [weak self] buffer, _ in
-            self?.handleBuffer(buffer, session: session)
-        }
-
         do {
-            engine.prepare()
-            try engine.start()
+            try controller.start()
         } catch {
             clearSessionIfNeeded(session)
             teardown(session: session)
             session.logHandler?(
                 "[Mic] Failed to start capture requested=\(Self.describe(device: session.requestedInputDevice)) " +
-                "resolved=\(Self.describe(device: session.activeInputDevice)) " +
-                "input=\(Self.describe(format: preStartInputFormat)): \(error.localizedDescription)"
+                "resolved=\(Self.describe(name: session.resolvedInputDeviceName, uid: session.resolvedInputDeviceUID)) " +
+                "defaultInput=\(Self.describe(device: session.defaultInputDevice)) " +
+                "defaultOutput=\(Self.describe(outputDevice: session.defaultOutputDevice)) " +
+                "splitRouteArbitration=\(Self.describe(splitRouteArbitration: session.didEngageSplitRouteArbitration)): \(error.localizedDescription)"
             )
             throw error
         }
 
-        let startedInputFormat = input.outputFormat(forBus: 0)
-        session.activeInputDevice = Self.currentInputDevice(for: input, availableDevices: availableDevices)
-            ?? session.activeInputDevice
+        session.resolvedInputDeviceUID = controller.resolvedInputDeviceUID ?? session.resolvedInputDeviceUID
+        session.resolvedInputDeviceName = controller.resolvedInputDeviceName ?? session.resolvedInputDeviceName
         session.logHandler?(
-            "[Mic] Engine started device=\(Self.describe(device: session.activeInputDevice)) " +
+            "[Mic] Capture session started device=\(Self.describe(name: session.resolvedInputDeviceName, uid: session.resolvedInputDeviceUID)) " +
             "requested=\(Self.describe(device: session.requestedInputDevice)) " +
-            "input=\(Self.describe(format: startedInputFormat)) output=\(Self.describe(format: outputFormat))"
+            "defaultInput=\(Self.describe(device: session.defaultInputDevice)) " +
+            "defaultOutput=\(Self.describe(outputDevice: session.defaultOutputDevice)) " +
+            "splitRouteArbitration=\(Self.describe(splitRouteArbitration: session.didEngageSplitRouteArbitration))"
         )
-        if !Self.formatsMatch(preStartInputFormat, startedInputFormat) {
-            session.logHandler?(
-                "[Mic] Input format changed during start preflight=\(Self.describe(format: preStartInputFormat)) " +
-                "postStart=\(Self.describe(format: startedInputFormat))"
-            )
-        }
         session.onStarted?()
     }
 
@@ -254,36 +317,88 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
         teardown(session: session)
         session.logHandler?(
             "[Mic] Stopped capture after \(Self.elapsedDescription(since: session.startedAt)) " +
-            "(device=\(Self.describe(device: session.activeInputDevice)), rawInput=\(session.hasDeliveredFirstInputBuffer), convertedChunk=\(session.hasDeliveredFirstChunk))"
+            "(device=\(Self.describe(name: session.resolvedInputDeviceName, uid: session.resolvedInputDeviceUID)), rawInput=\(session.hasDeliveredFirstInputBuffer), convertedChunk=\(session.hasDeliveredFirstChunk))"
         )
     }
 
-    private func handleConfigurationChange(for session: CaptureSession) {
-        guard isCurrentSession(session) else { return }
-        let activeDevices = availableInputDevices()
-        session.activeInputDevice = Self.currentInputDevice(for: session.engine.inputNode, availableDevices: activeDevices)
-            ?? session.activeInputDevice
-        let currentFormat = session.engine.inputNode.outputFormat(forBus: 0)
-        session.logHandler?(
-            "[Mic] Configuration changed device=\(Self.describe(device: session.activeInputDevice)) " +
-            "input=\(Self.describe(format: currentFormat))"
+    fileprivate static func makePCMBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
+        guard
+            CMSampleBufferGetNumSamples(sampleBuffer) > 0,
+            let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+            let streamDescriptionPointer = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)
+        else {
+            return nil
+        }
+
+        var streamDescription = streamDescriptionPointer.pointee
+        guard let format = AVAudioFormat(streamDescription: &streamDescription) else {
+            return nil
+        }
+
+        let frameLength = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
+        guard let pcmBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameLength) else {
+            return nil
+        }
+        pcmBuffer.frameLength = frameLength
+
+        var bufferListSizeNeeded = 0
+        let sizingStatus = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: &bufferListSizeNeeded,
+            bufferListOut: nil,
+            bufferListSize: 0,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+            blockBufferOut: nil
         )
+        guard sizingStatus == noErr, bufferListSizeNeeded > 0 else {
+            return nil
+        }
+
+        let rawBufferList = UnsafeMutableRawPointer.allocate(
+            byteCount: bufferListSizeNeeded,
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { rawBufferList.deallocate() }
+
+        let audioBufferList = rawBufferList.bindMemory(to: AudioBufferList.self, capacity: 1)
+        var retainedBlockBuffer: CMBlockBuffer?
+        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: &bufferListSizeNeeded,
+            bufferListOut: audioBufferList,
+            bufferListSize: bufferListSizeNeeded,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+            blockBufferOut: &retainedBlockBuffer
+        )
+        guard status == noErr else {
+            return nil
+        }
+
+        copyAudioBufferList(audioBufferList, into: pcmBuffer)
+        return pcmBuffer
     }
 
-    private func handleBuffer(_ buffer: AVAudioPCMBuffer, session: CaptureSession) {
+    private func handlePCMBuffer(_ buffer: AVAudioPCMBuffer, session: CaptureSession) {
         guard isCurrentSession(session) else { return }
-
-        session.activeInputDevice = Self.currentInputDevice(for: session.engine.inputNode, availableDevices: availableInputDevices())
-            ?? session.activeInputDevice
-        guard let converter = ensureConverter(for: buffer.format, session: session) else { return }
+        guard buffer.format.channelCount > 0 else {
+            emitError(CaptureError.missingInputFormat, session: session)
+            return
+        }
 
         if markFirstInputBufferIfNeeded(for: session) {
             session.logHandler?(
                 "[Mic] First input buffer after \(Self.elapsedDescription(since: session.startedAt)) " +
-                "device=\(Self.describe(device: session.activeInputDevice)) format=\(Self.describe(format: buffer.format))"
+                "device=\(Self.describe(name: session.resolvedInputDeviceName, uid: session.resolvedInputDeviceUID)) " +
+                "format=\(Self.describe(format: buffer.format))"
             )
             session.onFirstInputBuffer?()
         }
+
+        guard let converter = ensureConverter(for: buffer.format, session: session) else { return }
 
         let outputCapacity = Self.convertedFrameCapacity(
             inputFrameLength: buffer.frameLength,
@@ -297,7 +412,6 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
 
         var error: NSError?
         let inputBlock = Self.makeSingleUseInputBlock(buffer: buffer)
-
         let status = converter.convert(to: converted, error: &error, withInputFrom: inputBlock)
         if let error {
             emitError(error, session: session)
@@ -328,8 +442,8 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
         if markFirstChunkIfNeeded(for: session) {
             session.logHandler?(
                 "[Mic] First converted chunk after \(Self.elapsedDescription(since: session.startedAt)) " +
-                "device=\(Self.describe(device: session.activeInputDevice)) input=\(Self.describe(format: buffer.format)) " +
-                "output=\(Self.describe(format: session.outputFormat))"
+                "device=\(Self.describe(name: session.resolvedInputDeviceName, uid: session.resolvedInputDeviceUID)) " +
+                "input=\(Self.describe(format: buffer.format)) output=\(Self.describe(format: session.outputFormat))"
             )
             session.onFirstChunk?()
         }
@@ -424,13 +538,10 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
     }
 
     private func teardown(session: CaptureSession) {
-        if let configurationObserver = session.configurationObserver {
-            NotificationCenter.default.removeObserver(configurationObserver)
-            session.configurationObserver = nil
-        }
-        session.engine.inputNode.removeTap(onBus: 0)
-        session.engine.stop()
-        session.engine.reset()
+        session.controller?.stop()
+        session.controller = nil
+        session.converter = nil
+        session.inputFormat = nil
     }
 
     private func installAudioDeviceListeners() {
@@ -521,6 +632,11 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
         }
     }
 
+    private static func resolveDefaultInputDevice() -> InputDevice? {
+        guard let defaultDeviceID = defaultInputDeviceID() else { return nil }
+        return enumerateInputDevices().first(where: { $0.deviceID == defaultDeviceID })
+    }
+
     private static func defaultInputDeviceID() -> AudioDeviceID? {
         var defaultInputAddress = defaultInputPropertyAddress()
         return readScalarProperty(
@@ -528,47 +644,6 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
             address: &defaultInputAddress,
             as: AudioDeviceID.self
         )
-    }
-
-    private static func currentInputDevice(
-        for inputNode: AVAudioInputNode,
-        availableDevices: [InputDevice]
-    ) -> InputDevice? {
-        guard let audioUnit = inputNode.audioUnit else { return nil }
-
-        var deviceID = AudioDeviceID(0)
-        var propertySize = UInt32(MemoryLayout<AudioDeviceID>.size)
-        let status = AudioUnitGetProperty(
-            audioUnit,
-            kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global,
-            0,
-            &deviceID,
-            &propertySize
-        )
-        guard status == noErr else { return nil }
-
-        return availableDevices.first(where: { $0.deviceID == deviceID })
-            ?? enumerateInputDevices().first(where: { $0.deviceID == deviceID })
-    }
-
-    private static func selectInputDevice(_ device: InputDevice, on inputNode: AVAudioInputNode) throws {
-        guard let audioUnit = inputNode.audioUnit else {
-            throw CaptureError.missingInputAudioUnit
-        }
-
-        var mutableDeviceID = device.deviceID
-        let status = AudioUnitSetProperty(
-            audioUnit,
-            kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global,
-            0,
-            &mutableDeviceID,
-            UInt32(MemoryLayout<AudioDeviceID>.size)
-        )
-        guard status == noErr else {
-            throw CaptureError.unableToSelectInputDevice(name: device.name, status: status)
-        }
     }
 
     private static func hasInputStreams(deviceID: AudioDeviceID) -> Bool {
@@ -684,7 +759,7 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
         let count = Int(propertySize) / MemoryLayout<T>.stride
         guard count > 0 else { return [] }
 
-        var values = Array<T>(unsafeUninitializedCapacity: count) { buffer, initializedCount in
+        var values = Array<T>(unsafeUninitializedCapacity: count) { _, initializedCount in
             initializedCount = count
         }
         let status = values.withUnsafeMutableBytes { rawBuffer in
@@ -694,15 +769,61 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
         return values
     }
 
+    private static func copyAudioBufferList(
+        _ source: UnsafeMutablePointer<AudioBufferList>,
+        into destination: AVAudioPCMBuffer
+    ) {
+        let sourceBuffers = UnsafeMutableAudioBufferListPointer(source)
+        let destinationBuffers = UnsafeMutableAudioBufferListPointer(destination.mutableAudioBufferList)
+        let count = min(sourceBuffers.count, destinationBuffers.count)
+        guard count > 0 else { return }
+
+        for index in 0..<count {
+            let byteCount = Int(min(sourceBuffers[index].mDataByteSize, destinationBuffers[index].mDataByteSize))
+            guard
+                byteCount > 0,
+                let sourceData = sourceBuffers[index].mData,
+                let destinationData = destinationBuffers[index].mData
+            else {
+                continue
+            }
+            memcpy(destinationData, sourceData, byteCount)
+            destinationBuffers[index].mDataByteSize = UInt32(byteCount)
+        }
+    }
+
     private static func formatsMatch(_ lhs: AVAudioFormat, _ rhs: AVAudioFormat) -> Bool {
         lhs.channelCount == rhs.channelCount
             && lhs.commonFormat == rhs.commonFormat
+            && lhs.isInterleaved == rhs.isInterleaved
             && abs(lhs.sampleRate - rhs.sampleRate) < 0.5
     }
 
     private static func describe(device: InputDevice?) -> String {
         guard let device else { return "system-default" }
         return "\(device.name) [\(device.uid)]"
+    }
+
+    private static func describe(name: String?, uid: String?) -> String {
+        switch (name, uid) {
+        case (.some(let name), .some(let uid)):
+            return "\(name) [\(uid)]"
+        case (.some(let name), .none):
+            return name
+        case (.none, .some(let uid)):
+            return "[\(uid)]"
+        case (.none, .none):
+            return "system-default"
+        }
+    }
+
+    private static func describe(outputDevice: MicrophoneRouteCoordinator.OutputDevice?) -> String {
+        guard let outputDevice else { return "system-default" }
+        return "\(outputDevice.name) [\(outputDevice.uid)]"
+    }
+
+    private static func describe(splitRouteArbitration: Bool) -> String {
+        splitRouteArbitration ? "engaged" : "skipped"
     }
 
     private static func describe(format: AVAudioFormat) -> String {
@@ -728,6 +849,23 @@ final class MicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sen
         let elapsedNanoseconds = DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds
         let elapsedMilliseconds = Double(elapsedNanoseconds) / 1_000_000
         return String(format: "%.0fms", elapsedMilliseconds)
+    }
+
+    private static func backendBanner(
+        buildInfoProvider: @Sendable () -> (version: String, build: String)
+    ) -> String? {
+        backendBannerLock.lock()
+        defer { backendBannerLock.unlock() }
+        guard !hasLoggedBackendBanner else { return nil }
+        hasLoggedBackendBanner = true
+        let buildInfo = buildInfoProvider()
+        return "[Mic] backend=avcapture version=\(buildInfo.version) build=\(buildInfo.build)"
+    }
+
+    static func resetBackendBannerForTesting() {
+        backendBannerLock.lock()
+        hasLoggedBackendBanner = false
+        backendBannerLock.unlock()
     }
 
     static func convertedFrameCapacity(
@@ -759,9 +897,11 @@ private final class InputBlockState: @unchecked Sendable {
 }
 
 private final class CaptureSession: @unchecked Sendable {
-    let engine: AVAudioEngine
     let outputFormat: AVAudioFormat
     let requestedInputDevice: MicrophoneCaptureService.InputDevice?
+    let defaultInputDevice: MicrophoneCaptureService.InputDevice?
+    let defaultOutputDevice: MicrophoneRouteCoordinator.OutputDevice?
+    let didEngageSplitRouteArbitration: Bool
     let chunkHandler: @Sendable (MicrophoneCaptureService.CaptureChunk) -> Void
     let onStarted: (@Sendable () -> Void)?
     let onFirstInputBuffer: (@Sendable () -> Void)?
@@ -769,18 +909,22 @@ private final class CaptureSession: @unchecked Sendable {
     let onError: (@Sendable (Error) -> Void)?
     let logHandler: (@Sendable (String) -> Void)?
     let startedAt: DispatchTime
-    var activeInputDevice: MicrophoneCaptureService.InputDevice?
+    var resolvedInputDeviceUID: String?
+    var resolvedInputDeviceName: String?
+    var controller: (any MicrophoneCaptureControlling)?
     var inputFormat: AVAudioFormat?
     var converter: AVAudioConverter?
-    var configurationObserver: NSObjectProtocol?
     var hasDeliveredFirstInputBuffer = false
     var hasDeliveredFirstChunk = false
 
     init(
-        engine: AVAudioEngine,
         outputFormat: AVAudioFormat,
         requestedInputDevice: MicrophoneCaptureService.InputDevice?,
-        activeInputDevice: MicrophoneCaptureService.InputDevice?,
+        defaultInputDevice: MicrophoneCaptureService.InputDevice?,
+        defaultOutputDevice: MicrophoneRouteCoordinator.OutputDevice?,
+        didEngageSplitRouteArbitration: Bool,
+        resolvedInputDeviceUID: String?,
+        resolvedInputDeviceName: String?,
         chunkHandler: @escaping @Sendable (MicrophoneCaptureService.CaptureChunk) -> Void,
         onStarted: (@Sendable () -> Void)?,
         onFirstInputBuffer: (@Sendable () -> Void)?,
@@ -788,10 +932,13 @@ private final class CaptureSession: @unchecked Sendable {
         onError: (@Sendable (Error) -> Void)?,
         logHandler: (@Sendable (String) -> Void)?
     ) {
-        self.engine = engine
         self.outputFormat = outputFormat
         self.requestedInputDevice = requestedInputDevice
-        self.activeInputDevice = activeInputDevice
+        self.defaultInputDevice = defaultInputDevice
+        self.defaultOutputDevice = defaultOutputDevice
+        self.didEngageSplitRouteArbitration = didEngageSplitRouteArbitration
+        self.resolvedInputDeviceUID = resolvedInputDeviceUID
+        self.resolvedInputDeviceName = resolvedInputDeviceName
         self.chunkHandler = chunkHandler
         self.onStarted = onStarted
         self.onFirstInputBuffer = onFirstInputBuffer
@@ -799,5 +946,201 @@ private final class CaptureSession: @unchecked Sendable {
         self.onError = onError
         self.logHandler = logHandler
         self.startedAt = DispatchTime.now()
+    }
+}
+
+private final class AVFoundationMicrophoneCaptureControllerFactory: MicrophoneCaptureControllerFactory, @unchecked Sendable {
+    private let captureDevicesProvider: @Sendable () -> [AVCaptureDevice]
+
+    init(captureDevicesProvider: @escaping @Sendable () -> [AVCaptureDevice] = {
+        AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.microphone],
+            mediaType: .audio,
+            position: .unspecified
+        ).devices
+    }) {
+        self.captureDevicesProvider = captureDevicesProvider
+    }
+
+    func makeController(
+        preferredInputDeviceUID: String?,
+        onPCMBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void,
+        onError: @escaping @Sendable (Error) -> Void
+    ) throws -> any MicrophoneCaptureControlling {
+        let captureDevices = captureDevicesProvider()
+        let requestedDevice = preferredInputDeviceUID.flatMap { uid in
+            captureDevices.first(where: { $0.uniqueID == uid })
+        }
+        let fallbackDevice = AVCaptureDevice.default(for: .audio)
+            ?? captureDevices.first
+        guard let resolvedDevice = requestedDevice ?? fallbackDevice else {
+            throw MicrophoneCaptureService.CaptureError.missingCaptureInputDevice
+        }
+
+        return try AVFoundationMicrophoneCaptureController(
+            requestedInputDeviceUID: preferredInputDeviceUID,
+            resolvedDevice: resolvedDevice,
+            onPCMBuffer: onPCMBuffer,
+            onError: onError
+        )
+    }
+}
+
+private final class AVFoundationMicrophoneCaptureController: NSObject, MicrophoneCaptureControlling, @unchecked Sendable {
+    let requestedInputDeviceUID: String?
+    let resolvedInputDeviceUID: String?
+    let resolvedInputDeviceName: String?
+
+    private let session = AVCaptureSession()
+    private let sessionQueue = DispatchQueue(label: "MacAssistant.MicrophoneCaptureService.session")
+    private let audioOutput = AVCaptureAudioDataOutput()
+    private let outputDelegate: CaptureAudioOutputDelegate
+    private let onError: @Sendable (Error) -> Void
+    private let controllerStateLock = NSLock()
+    private var deviceInput: AVCaptureDeviceInput?
+    private var observerTokens: [NSObjectProtocol] = []
+    private var isStopped = false
+
+    init(
+        requestedInputDeviceUID: String?,
+        resolvedDevice: AVCaptureDevice,
+        onPCMBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void,
+        onError: @escaping @Sendable (Error) -> Void
+    ) throws {
+        self.requestedInputDeviceUID = requestedInputDeviceUID
+        self.resolvedInputDeviceUID = resolvedDevice.uniqueID
+        self.resolvedInputDeviceName = resolvedDevice.localizedName
+        self.onError = onError
+        self.outputDelegate = CaptureAudioOutputDelegate { sampleBuffer in
+            guard let pcmBuffer = MicrophoneCaptureService.makePCMBuffer(from: sampleBuffer) else {
+                onError(MicrophoneCaptureService.CaptureError.unableToCreatePCMBuffer)
+                return
+            }
+            onPCMBuffer(pcmBuffer)
+        }
+        super.init()
+
+        do {
+            let deviceInput = try AVCaptureDeviceInput(device: resolvedDevice)
+            self.deviceInput = deviceInput
+            try configureSession(with: deviceInput)
+            registerObservers()
+        } catch let error as MicrophoneCaptureService.CaptureError {
+            throw error
+        } catch {
+            throw MicrophoneCaptureService.CaptureError.unableToCreateCaptureInput(name: resolvedDevice.localizedName)
+        }
+    }
+
+    func start() throws {
+        try sessionQueue.sync {
+            guard !isStopped else {
+                throw MicrophoneCaptureService.CaptureError.captureSessionFailedToStart
+            }
+            session.startRunning()
+            guard session.isRunning else {
+                throw MicrophoneCaptureService.CaptureError.captureSessionFailedToStart
+            }
+        }
+    }
+
+    func stop() {
+        sessionQueue.sync {
+            guard markStoppedIfNeeded() else { return }
+            audioOutput.setSampleBufferDelegate(nil, queue: nil)
+            if session.isRunning {
+                session.stopRunning()
+            }
+            session.beginConfiguration()
+            if session.outputs.contains(audioOutput) {
+                session.removeOutput(audioOutput)
+            }
+            if let deviceInput, session.inputs.contains(deviceInput) {
+                session.removeInput(deviceInput)
+            }
+            session.commitConfiguration()
+            deviceInput = nil
+        }
+        removeObservers()
+    }
+
+    private func configureSession(with deviceInput: AVCaptureDeviceInput) throws {
+        session.beginConfiguration()
+        defer { session.commitConfiguration() }
+
+        guard session.canAddInput(deviceInput) else {
+            throw MicrophoneCaptureService.CaptureError.unableToAddCaptureInput(name: deviceInput.device.localizedName)
+        }
+        session.addInput(deviceInput)
+
+        audioOutput.audioSettings = [AVFormatIDKey: kAudioFormatLinearPCM]
+        audioOutput.setSampleBufferDelegate(outputDelegate, queue: sessionQueue)
+        guard session.canAddOutput(audioOutput) else {
+            throw MicrophoneCaptureService.CaptureError.unableToAddCaptureOutput
+        }
+        session.addOutput(audioOutput)
+    }
+
+    private func registerObservers() {
+        let runtimeErrorToken = NotificationCenter.default.addObserver(
+            forName: AVCaptureSession.runtimeErrorNotification,
+            object: session,
+            queue: nil
+        ) { [weak self] notification in
+            guard let self, !self.hasStopped else { return }
+            if let error = notification.userInfo?[AVCaptureSessionErrorKey] as? NSError {
+                self.onError(error)
+            } else {
+                self.onError(MicrophoneCaptureService.CaptureError.captureSessionFailedToStart)
+            }
+        }
+        let interruptedToken = NotificationCenter.default.addObserver(
+            forName: AVCaptureSession.wasInterruptedNotification,
+            object: session,
+            queue: nil
+        ) { [weak self] notification in
+            guard let self, !self.hasStopped else { return }
+            self.onError(MicrophoneCaptureService.CaptureError.captureSessionInterrupted(reason: "system"))
+        }
+        observerTokens = [runtimeErrorToken, interruptedToken]
+    }
+
+    private func removeObservers() {
+        let tokens = observerTokens
+        observerTokens.removeAll(keepingCapacity: false)
+        for token in tokens {
+            NotificationCenter.default.removeObserver(token)
+        }
+    }
+
+    private var hasStopped: Bool {
+        controllerStateLock.lock()
+        defer { controllerStateLock.unlock() }
+        return isStopped
+    }
+
+    private func markStoppedIfNeeded() -> Bool {
+        controllerStateLock.lock()
+        defer { controllerStateLock.unlock() }
+        guard !isStopped else { return false }
+        isStopped = true
+        return true
+    }
+}
+
+private final class CaptureAudioOutputDelegate: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+    private let sampleBufferHandler: @Sendable (CMSampleBuffer) -> Void
+
+    init(sampleBufferHandler: @escaping @Sendable (CMSampleBuffer) -> Void) {
+        self.sampleBufferHandler = sampleBufferHandler
+        super.init()
+    }
+
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        sampleBufferHandler(sampleBuffer)
     }
 }

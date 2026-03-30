@@ -130,6 +130,7 @@ final class AppModel {
     private let shouldPersistSettings: Bool
     @ObservationIgnored private let runtime: any RuntimeClienting
     @ObservationIgnored private let microphoneService: any MicrophoneCaptureServicing
+    @ObservationIgnored private let microphoneRouteCoordinator: any MicrophoneRouteCoordinating
     @ObservationIgnored private let playbackService: any AudioPlaybackServicing
     private let microphoneStartRetryDelay: Duration
     private static let retryableMicrophoneStartErrorCode = -10868
@@ -263,12 +264,12 @@ final class AppModel {
     private var activeTurnIDs = Set<String>()
     private var activeResponseTurnID: String?
     private var activeSpeechTurnID: String?
-    private var activeSpeechSourceTurnID: String?
+    private var activeSpeechSourceAssistantSegmentID: String?
     private var transcriptSpeechPhase: TranscriptSpeechPhase = .idle
     private var activeReplySpeechTurnID: String?
     private var replySpeechPhase: ReplySpeechPhase = .idle
     private var speechOnlyTurnIDs = Set<String>()
-    private var assistantMessageIDsByTurn: [String: UUID] = [:]
+    private var assistantMessageIDsBySegment: [String: UUID] = [:]
     private var voiceDraftIDsByTurn: [String: UUID] = [:]
     private var toolMessageIDsByCall: [String: UUID] = [:]
     private var discardedTurnIDs = Set<String>()
@@ -282,6 +283,7 @@ final class AppModel {
     private var voiceRecordingState: VoiceRecordingState?
     @ObservationIgnored private var voiceCaptureWaitingTask: Task<Void, Never>?
     @ObservationIgnored private var microphoneStartRetryTask: Task<Void, Never>?
+    @ObservationIgnored private var microphoneRoutePreflightTask: Task<Void, Never>?
     @ObservationIgnored private var microphoneAccessTask: Task<Void, Never>?
 
     private var attachmentsDirectoryURL: URL {
@@ -293,6 +295,7 @@ final class AppModel {
         persistSettings: Bool? = nil,
         runtime: (any RuntimeClienting)? = nil,
         microphoneService: (any MicrophoneCaptureServicing)? = nil,
+        microphoneRouteCoordinator: (any MicrophoneRouteCoordinating)? = nil,
         playbackService: (any AudioPlaybackServicing)? = nil,
         voiceCaptureWaitingDelay: Duration = .seconds(2),
         microphoneStartRetryDelay: Duration = .milliseconds(250)
@@ -303,6 +306,7 @@ final class AppModel {
         self.shouldPersistSettings = shouldPersistSettings
         self.runtime = runtime ?? AgentRuntimeClient(appSupportURL: supportURL)
         self.microphoneService = microphoneService ?? MicrophoneCaptureService()
+        self.microphoneRouteCoordinator = microphoneRouteCoordinator ?? MicrophoneRouteCoordinator.shared
         self.playbackService = playbackService ?? AudioPlaybackService()
         self.voiceCaptureWaitingDelay = voiceCaptureWaitingDelay
         self.microphoneStartRetryDelay = microphoneStartRetryDelay
@@ -442,9 +446,11 @@ final class AppModel {
 
         microphoneAccessTask?.cancel()
         microphoneAccessTask = nil
+        cancelMicrophoneRoutePreflight()
         cancelVoiceCaptureWaitingTask()
         cancelMicrophoneStartRetryTask()
         microphoneService.stop()
+        microphoneRouteCoordinator.leaveRecordingRoute()
         voiceRecordingState = nil
         playbackService.stop()
         activeTurnIDs.removeAll()
@@ -712,8 +718,10 @@ final class AppModel {
     func stopRecording() {
         guard var state = voiceRecordingState, state.phase == .capturing else { return }
 
+        cancelMicrophoneRoutePreflight()
         cancelMicrophoneStartRetryTask()
         microphoneService.stop()
+        microphoneRouteCoordinator.leaveRecordingRoute()
         cancelVoiceCaptureWaitingTask()
         state.isWaitingForAudio = false
 
@@ -823,9 +831,11 @@ final class AppModel {
 
         microphoneAccessTask?.cancel()
         microphoneAccessTask = nil
+        cancelMicrophoneRoutePreflight()
         cancelVoiceCaptureWaitingTask()
         cancelMicrophoneStartRetryTask()
         microphoneService.stop()
+        microphoneRouteCoordinator.leaveRecordingRoute()
         voiceRecordingState = nil
         cancelActiveSpeechPlaybackIfNeeded()
         playbackService.stop()
@@ -838,7 +848,7 @@ final class AppModel {
         resetReplySpeechState()
         resetTranscriptSpeechState()
         speechOnlyTurnIDs.removeAll()
-        assistantMessageIDsByTurn.removeAll()
+        assistantMessageIDsBySegment.removeAll()
         voiceDraftIDsByTurn.removeAll()
         toolMessageIDsByCall.removeAll()
         statusText = "Ready"
@@ -1088,6 +1098,11 @@ final class AppModel {
         return "\(inputDevice.name) [\(inputDevice.uid)]"
     }
 
+    private func describe(outputDevice: MicrophoneRouteCoordinator.OutputDevice?) -> String {
+        guard let outputDevice else { return "system-default" }
+        return "\(outputDevice.name) [\(outputDevice.uid)]"
+    }
+
     private func scheduleVoiceCaptureWaitingTask(for turnID: String) {
         cancelVoiceCaptureWaitingTask()
         let delay = voiceCaptureWaitingDelay
@@ -1107,20 +1122,76 @@ final class AppModel {
 
     private func startMicrophoneCapture(for turnID: String, isRetry: Bool) {
         guard let state = voiceRecordingState, state.turnID == turnID, state.phase == .capturing else { return }
+        cancelMicrophoneRoutePreflight()
 
         let resolvedInputDevice = resolvedPreferredInputDevice()
+        let routeState = microphoneRouteCoordinator.routeStateSnapshot()
         if isRetry {
             appendRuntimeLog(
                 "[Mic] Retrying capture preference=\(describe(inputPreference: settings.inputDevicePreference)) " +
-                "resolved=\(describe(inputDevice: resolvedInputDevice))"
+                "resolved=\(describe(inputDevice: resolvedInputDevice)) " +
+                "defaultOutput=\(describe(outputDevice: routeState.defaultOutputDevice))"
             )
         } else {
             appendRuntimeLog(
                 "[Mic] Starting capture preference=\(describe(inputPreference: settings.inputDevicePreference)) " +
-                "resolved=\(describe(inputDevice: resolvedInputDevice))"
+                "resolved=\(describe(inputDevice: resolvedInputDevice)) " +
+                "defaultOutput=\(describe(outputDevice: routeState.defaultOutputDevice))"
             )
         }
 
+        microphoneRoutePreflightTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.microphoneRoutePreflightTask = nil }
+
+            do {
+                let preflightResult = try await self.microphoneRouteCoordinator.prepareForRecording(inputDevice: resolvedInputDevice)
+                guard !Task.isCancelled else {
+                    self.microphoneRouteCoordinator.leaveRecordingRoute()
+                    return
+                }
+                guard let activeState = self.voiceRecordingState, activeState.turnID == turnID, activeState.phase == .capturing else {
+                    self.microphoneRouteCoordinator.leaveRecordingRoute()
+                    return
+                }
+
+                self.appendRuntimeLog(
+                    "[Mic] Split-route preflight \(preflightResult.didEngageArbitration ? "engaged" : "skipped") " +
+                    "requestedInput=\(self.describe(inputDevice: resolvedInputDevice)) " +
+                    "defaultOutput=\(self.describe(outputDevice: preflightResult.defaultOutputDevice))"
+                )
+                self.beginMicrophoneCaptureSession(
+                    for: turnID,
+                    resolvedInputDevice: resolvedInputDevice,
+                    currentState: activeState
+                )
+            } catch is CancellationError {
+                self.microphoneRouteCoordinator.leaveRecordingRoute()
+            } catch {
+                self.microphoneRouteCoordinator.leaveRecordingRoute()
+                if self.handleRetryableCaptureStartFailure(
+                    for: turnID,
+                    error: error,
+                    attemptedInputDevice: resolvedInputDevice,
+                    currentState: state
+                ) {
+                    return
+                }
+                self.failVoiceRecording(
+                    turnID: turnID,
+                    message: error.localizedDescription,
+                    restorePendingImage: true,
+                    cancelRuntime: false
+                )
+            }
+        }
+    }
+
+    private func beginMicrophoneCaptureSession(
+        for turnID: String,
+        resolvedInputDevice: MicrophoneCaptureService.InputDevice?,
+        currentState: VoiceRecordingState
+    ) {
         do {
             try microphoneService.start(
                 preferredInputDeviceUID: resolvedInputDevice?.uid,
@@ -1157,11 +1228,12 @@ final class AppModel {
             )
             scheduleVoiceCaptureWaitingTask(for: turnID)
         } catch {
+            microphoneRouteCoordinator.leaveRecordingRoute()
             if handleRetryableCaptureStartFailure(
                 for: turnID,
                 error: error,
                 attemptedInputDevice: resolvedInputDevice,
-                currentState: state
+                currentState: currentState
             ) {
                 return
             }
@@ -1189,17 +1261,22 @@ final class AppModel {
         voiceRecordingState = state
         refreshAvailableInputDevices()
         let retriedInputDevice = resolvedPreferredInputDevice()
+        let routeState = microphoneRouteCoordinator.routeStateSnapshot()
         appendRuntimeLog(
             "[Mic] Capture start failed before audio arrived: \(error.localizedDescription). " +
             "Retrying in \(Self.describe(duration: microphoneStartRetryDelay)) " +
             "attempted=\(describe(inputDevice: attemptedInputDevice)) " +
-            "resolved=\(describe(inputDevice: retriedInputDevice))"
+            "resolved=\(describe(inputDevice: retriedInputDevice)) " +
+            "defaultOutput=\(describe(outputDevice: routeState.defaultOutputDevice))"
         )
         scheduleMicrophoneStartRetry(for: turnID)
         return true
     }
 
     private func isRetryableMicrophoneStartError(_ error: Error) -> Bool {
+        if error is MicrophoneRouteCoordinator.PreflightError {
+            return true
+        }
         let nsError = error as NSError
         return nsError.code == Self.retryableMicrophoneStartErrorCode
     }
@@ -1225,12 +1302,19 @@ final class AppModel {
         microphoneStartRetryTask = nil
     }
 
+    private func cancelMicrophoneRoutePreflight() {
+        microphoneRoutePreflightTask?.cancel()
+        microphoneRoutePreflightTask = nil
+        microphoneRouteCoordinator.cancelPendingPreparation()
+    }
+
     private func failVoiceRecording(
         turnID: String,
         message: String,
         restorePendingImage: Bool,
         cancelRuntime: Bool
     ) {
+        microphoneRouteCoordinator.leaveRecordingRoute()
         if let state = voiceRecordingState, state.turnID == turnID {
             discardVoiceRecording(
                 state,
@@ -1251,9 +1335,11 @@ final class AppModel {
     ) {
         microphoneAccessTask?.cancel()
         microphoneAccessTask = nil
+        cancelMicrophoneRoutePreflight()
         cancelVoiceCaptureWaitingTask()
         cancelMicrophoneStartRetryTask()
         microphoneService.stop()
+        microphoneRouteCoordinator.leaveRecordingRoute()
         if restorePendingImage {
             restorePendingComposerImage(from: state.imageAttachment)
         }
@@ -1375,7 +1461,7 @@ final class AppModel {
     }
 
     func isSpeakingAssistantMessage(_ message: AssistantMessage) -> Bool {
-        activeSpeechSourceTurnID == message.turnID && transcriptSpeechPhase != .idle
+        activeSpeechSourceAssistantSegmentID == message.segmentID && transcriptSpeechPhase != .idle
     }
 
     func canToggleSpeech(for message: AssistantMessage) -> Bool {
@@ -1397,7 +1483,7 @@ final class AppModel {
         let turnID = UUID().uuidString
         activeTurnIDs.insert(turnID)
         activeSpeechTurnID = turnID
-        activeSpeechSourceTurnID = message.turnID
+        activeSpeechSourceAssistantSegmentID = message.segmentID
         transcriptSpeechPhase = .synthesizing
         speechOnlyTurnIDs.insert(turnID)
         statusText = "Speaking…"
@@ -1481,7 +1567,12 @@ final class AppModel {
             }
         case "assistant_delta":
             guard let turnID = event.turnID, !discardedTurnIDs.contains(turnID) else { return }
-            appendAssistantDelta(turnID: turnID, delta: event.text ?? "")
+            appendAssistantDelta(
+                turnID: turnID,
+                segmentID: event.assistantSegmentID ?? turnID,
+                delta: event.text ?? "",
+                isFinalSegment: event.isFinalSegment
+            )
         case "tool_proposed":
             handleToolProposal(event)
         case "tool_started":
@@ -1629,7 +1720,7 @@ final class AppModel {
         let wasSpeechOnlyTurn = speechOnlyTurnIDs.contains(turnID)
         let wasActiveVoiceTurn = voiceRecordingState?.turnID == turnID
         activeTurnIDs.remove(turnID)
-        finishAssistantMessage(turnID)
+        finishAssistantMessages(turnID)
         if wasActiveVoiceTurn {
             cancelVoiceCaptureWaitingTask()
             voiceRecordingState = nil
@@ -1701,12 +1792,12 @@ final class AppModel {
         }
     }
 
-    private func finishAssistantMessage(_ turnID: String) {
-        guard let messageID = assistantMessageIDsByTurn[turnID],
-              let index = conversation.firstIndex(where: { $0.id == messageID }),
-              case .assistantMessage(var message) = conversation[index] else { return }
-        message.isStreaming = false
-        conversation[index] = .assistantMessage(message)
+    private func finishAssistantMessages(_ turnID: String) {
+        for index in conversation.indices {
+            guard case .assistantMessage(var message) = conversation[index], message.turnID == turnID else { continue }
+            message.isStreaming = false
+            conversation[index] = .assistantMessage(message)
+        }
     }
 
     private func appendRuntimeLog(_ message: String) {
@@ -1718,12 +1809,14 @@ final class AppModel {
     private func pendingVoiceDraftCleanup() {
         microphoneAccessTask?.cancel()
         microphoneAccessTask = nil
+        cancelMicrophoneRoutePreflight()
         cancelVoiceCaptureWaitingTask()
+        microphoneRouteCoordinator.leaveRecordingRoute()
         voiceRecordingState = nil
         for turnID in voiceDraftIDsByTurn.keys {
             removeVoiceDraft(turnID: turnID)
         }
-        assistantMessageIDsByTurn.removeAll()
+        assistantMessageIDsBySegment.removeAll()
         voiceDraftIDsByTurn.removeAll()
         toolMessageIDsByCall.removeAll()
     }
@@ -1874,7 +1967,9 @@ final class AppModel {
                 }
                 userMessagesByTurn[message.turnID] = message
             case .assistantMessage(let message):
-                assistantMessagesByTurn[message.turnID] = message
+                if message.isFinalSegment {
+                    assistantMessagesByTurn[message.turnID] = message
+                }
             default:
                 break
             }
@@ -1903,6 +1998,15 @@ final class AppModel {
             ))
         }
         return history
+    }
+
+    private func finalAssistantMessage(for turnID: String) -> AssistantMessage? {
+        conversation.compactMap { item -> AssistantMessage? in
+            guard case .assistantMessage(let message) = item,
+                  message.turnID == turnID,
+                  message.isFinalSegment else { return nil }
+            return message
+        }.last
     }
 
     private func restorePendingComposerImage(from imageAttachment: ConversationImageAttachment?) {
@@ -2139,23 +2243,35 @@ final class AppModel {
         }
     }
 
-    private func appendAssistantDelta(turnID: String, delta: String) {
-        if let messageID = assistantMessageIDsByTurn[turnID],
+    private func appendAssistantDelta(
+        turnID: String,
+        segmentID: String,
+        delta: String,
+        isFinalSegment: Bool?
+    ) {
+        if let messageID = assistantMessageIDsBySegment[segmentID],
            let index = conversation.firstIndex(where: { $0.id == messageID }),
            case .assistantMessage(var message) = conversation[index] {
             message.text += delta
-            message.isStreaming = true
+            if let isFinalSegment {
+                message.isFinalSegment = isFinalSegment
+                message.isStreaming = false
+            } else {
+                message.isStreaming = true
+            }
             conversation[index] = .assistantMessage(message)
         } else {
             let message = AssistantMessage(
                 id: UUID(),
                 turnID: turnID,
+                segmentID: segmentID,
                 text: delta,
-                isStreaming: true,
+                isStreaming: isFinalSegment == nil,
                 isCancelled: false,
+                isFinalSegment: isFinalSegment ?? false,
                 source: voiceDraftIDsByTurn[turnID] == nil ? .typed : .voice
             )
-            assistantMessageIDsByTurn[turnID] = message.id
+            assistantMessageIDsBySegment[segmentID] = message.id
             conversation.append(.assistantMessage(message))
         }
     }
@@ -2218,7 +2334,7 @@ final class AppModel {
     }
 
     private func rebuildConversationIndices() {
-        assistantMessageIDsByTurn.removeAll()
+        assistantMessageIDsBySegment.removeAll()
         voiceDraftIDsByTurn.removeAll()
         toolMessageIDsByCall.removeAll()
 
@@ -2227,7 +2343,7 @@ final class AppModel {
             case .userVoiceDraft(let draft):
                 voiceDraftIDsByTurn[draft.turnID] = draft.id
             case .assistantMessage(let message):
-                assistantMessageIDsByTurn[message.turnID] = message.id
+                assistantMessageIDsBySegment[message.segmentID] = message.id
             case .toolInvocation(let tool):
                 toolMessageIDsByCall[tool.toolCallID] = tool.id
             default:
@@ -2294,7 +2410,7 @@ final class AppModel {
     private func cancelActiveSpeechPlaybackIfNeeded() {
         playbackService.stop()
         let turnID = activeSpeechTurnID
-        let hadTranscriptSpeech = activeSpeechSourceTurnID != nil
+        let hadTranscriptSpeech = activeSpeechSourceAssistantSegmentID != nil
         resetTranscriptSpeechState()
         guard let turnID else {
             if hadTranscriptSpeech {
@@ -2316,7 +2432,7 @@ final class AppModel {
     }
 
     private func handlePlaybackStarted() {
-        if activeSpeechSourceTurnID != nil {
+        if activeSpeechSourceAssistantSegmentID != nil {
             transcriptSpeechPhase = .playing
             return
         }
@@ -2326,7 +2442,7 @@ final class AppModel {
     }
 
     private func handlePlaybackFinished() {
-        if activeSpeechSourceTurnID != nil {
+        if activeSpeechSourceAssistantSegmentID != nil {
             if activeSpeechTurnID != nil {
                 transcriptSpeechPhase = .synthesizing
                 return
@@ -2342,11 +2458,12 @@ final class AppModel {
 
     private func resetTranscriptSpeechState() {
         activeSpeechTurnID = nil
-        activeSpeechSourceTurnID = nil
+        activeSpeechSourceAssistantSegmentID = nil
         transcriptSpeechPhase = .idle
     }
 
     private func beginReplySpeechIfNeeded(for turnID: String) {
+        guard finalAssistantMessage(for: turnID) != nil else { return }
         guard activeReplySpeechTurnID != turnID else { return }
         activeReplySpeechTurnID = turnID
         replySpeechPhase = .buffering

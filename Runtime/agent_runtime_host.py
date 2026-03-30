@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import wave
 from contextlib import redirect_stdout
 from dataclasses import dataclass, field
@@ -78,7 +79,6 @@ AGENT_RUNTIME_DEPENDENCIES = {
 }
 
 READ_ONLY_TOOL_NAMES = {"get_scripting_tips"}
-SYSTEM_INFO_SCRIPT = "return system info"
 NULL_TQDM_STREAM = open(os.devnull, "w", encoding="utf-8")
 
 
@@ -202,6 +202,37 @@ class ToolDefinition:
     name: str
     description: str
     input_schema: dict[str, Any]
+
+
+@dataclass
+class ToolCallRequest:
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class AssistantStepResult:
+    text: str
+    tool_calls: list[ToolCallRequest]
+
+
+@dataclass
+class PendingToolLoopState:
+    turn_id: str
+    user_message: dict[str, Any]
+    scratch_messages: list[dict[str, Any]]
+    pending_tool_calls: list[ToolCallRequest]
+    next_tool_index: int
+    speak_reply: bool
+    voice_preset: str
+
+
+@dataclass
+class PendingToolApproval:
+    turn_id: str
+    loop_state: PendingToolLoopState
+    tool_call_id: str
+    tool_call: ToolCallRequest
 
 
 @dataclass(frozen=True)
@@ -1141,11 +1172,12 @@ class RuntimeHost:
         self.turns: dict[str, TurnBuffer] = {}
         self.turn_states: dict[str, TurnExecutionState] = {}
         self.history: list[dict[str, Any]] = []
-        self.pending_tools: dict[str, dict[str, Any]] = {}
+        self.pending_tools: dict[str, PendingToolApproval] = {}
         self.install_tasks: dict[str, asyncio.Task[None]] = {}
         self.install_processes: dict[str, asyncio.subprocess.Process] = {}
         self.agent_model = None
         self.agent_processor = None
+        self.agent_tokenizer = None
         self.tts_model = None
         self.stt_model = None
         self.mcp_client = MacAutomatorClient()
@@ -1177,7 +1209,11 @@ class RuntimeHost:
         if state is None:
             return
         has_pending_tool = any(
-            pending.get("turn_id") == turn_id
+            (
+                pending.turn_id
+                if isinstance(pending, PendingToolApproval)
+                else pending.get("turn_id")
+            ) == turn_id
             for pending in self.pending_tools.values()
         )
         has_buffer = turn_id in self.turns
@@ -1225,7 +1261,12 @@ class RuntimeHost:
 
     def clear_pending_tools_for_turn(self, turn_id: str) -> None:
         for tool_call_id, pending in list(self.pending_tools.items()):
-            if pending.get("turn_id") == turn_id:
+            pending_turn_id = (
+                pending.turn_id
+                if isinstance(pending, PendingToolApproval)
+                else pending.get("turn_id")
+            )
+            if pending_turn_id == turn_id:
                 self.pending_tools.pop(tool_call_id, None)
 
     def start_turn_task(
@@ -1568,8 +1609,11 @@ class RuntimeHost:
             if model_id == "agent_model":
                 self.ensure_agent_runtime_dependencies()
                 from mlx_vlm import load
+                from mlx_lm.tokenizer_utils import load as load_tokenizer
 
                 self.agent_model, self.agent_processor = await asyncio.to_thread(load, state.path)
+                self.agent_tokenizer = await asyncio.to_thread(load_tokenizer, Path(state.path))
+                self.assert_agent_tool_template(Path(state.path))
             elif model_id == "tts_model":
                 from mlx_audio.tts.utils import load
 
@@ -1596,6 +1640,7 @@ class RuntimeHost:
         if model_id == "agent_model":
             self.agent_model = None
             self.agent_processor = None
+            self.agent_tokenizer = None
         elif model_id == "tts_model":
             self.tts_model = None
         elif model_id == "stt_model":
@@ -1689,76 +1734,102 @@ class RuntimeHost:
 
         self.raise_if_turn_cancelled(turn_id)
         user_message = self.build_user_message(resolved_user_text, attachments)
-        direct_tool_call = self.direct_tool_call_for_user_text(resolved_user_text)
-        if direct_tool_call is not None:
-            tool_plan = {"assistant_message": "", "tool_call": direct_tool_call}
-            tool_call = direct_tool_call
-        elif self.should_use_tool_planner(resolved_user_text, attachments):
-            tool_plan = await self.generate_agent_plan(user_message, turn_id=turn_id)
-            tool_call = self.choose_tool_call(resolved_user_text, tool_plan)
-        else:
-            assistant_message = await self.generate_direct_answer(
-                user_message,
+        scratch_messages = [
+            {"role": "system", "content": self.agent_loop_system_prompt()},
+            *self.history,
+            user_message,
+        ]
+        await self.continue_agent_loop(
+            PendingToolLoopState(
+                turn_id=turn_id,
+                user_message=user_message,
+                scratch_messages=scratch_messages,
+                pending_tool_calls=[],
+                next_tool_index=0,
+                speak_reply=speak_reply,
+                voice_preset=voice_preset,
+            )
+        )
+
+    async def continue_agent_loop(self, loop_state: PendingToolLoopState) -> None:
+        turn_id = loop_state.turn_id
+        while True:
+            self.raise_if_turn_cancelled(turn_id)
+            await self.refresh_tool_definitions()
+            tool_schemas = self.qwen_tool_schemas()
+            step = await self.generate_assistant_step(
+                loop_state.scratch_messages,
+                tool_schemas=tool_schemas,
                 turn_id=turn_id,
             )
             self.raise_if_turn_cancelled(turn_id)
+
+            segment_id: str | None = None
+            if step.text:
+                segment_id = f"assistant-segment-{uuid.uuid4()}"
+
+            if step.tool_calls:
+                if segment_id is not None:
+                    await self.stream_assistant_text(
+                        turn_id,
+                        step.text,
+                        assistant_segment_id=segment_id,
+                        is_final_segment=False,
+                    )
+                loop_state.scratch_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": step.text,
+                        "tool_calls": [
+                            {
+                                "id": f"call-{uuid.uuid4()}",
+                                "type": "function",
+                                "function": {
+                                    "name": tool_call.name,
+                                    "arguments": tool_call.arguments,
+                                },
+                            }
+                            for tool_call in step.tool_calls
+                        ],
+                    }
+                )
+                loop_state.pending_tool_calls = list(step.tool_calls)
+                loop_state.next_tool_index = 0
+                completed = await self.execute_or_pause_tool_calls(loop_state)
+                if not completed:
+                    return
+                continue
+
+            if segment_id is not None:
+                await self.stream_assistant_text(
+                    turn_id,
+                    step.text,
+                    assistant_segment_id=segment_id,
+                    is_final_segment=True,
+                )
+
+            if not step.text:
+                raise RuntimeError(
+                    "The Qwen agent returned neither an answer nor a tool call. Refresh or reinstall the local agent model/runtime and try again."
+                )
+
+            loop_state.scratch_messages.append(
+                {
+                    "role": "assistant",
+                    "content": step.text,
+                }
+            )
             self.history.extend(
                 [
-                    user_message,
-                    {"role": "assistant", "content": assistant_message},
+                    loop_state.user_message,
+                    {"role": "assistant", "content": step.text},
                 ]
             )
-            if speak_reply:
-                await self.speak(turn_id, assistant_message, voice_preset)
+            if loop_state.speak_reply:
+                await self.speak(turn_id, step.text, loop_state.voice_preset)
             self.raise_if_turn_cancelled(turn_id)
             self.emit_turn_finished(turn_id, status="finished", is_final=True)
             return
-        self.raise_if_turn_cancelled(turn_id)
-
-        if isinstance(tool_call, dict):
-            tool_name = tool_call.get("name", "")
-            tool_arguments = tool_call.get("arguments") or {}
-            tool_call_id = f"tool-{turn_id}"
-            safety_class, approval_state, execution_state = self.classify_tool(tool_name, tool_arguments)
-            summary = f"{tool_name} • {approval_state.replace('_', ' ')}"
-            self.pending_tools[tool_call_id] = {
-                "turn_id": turn_id,
-                "user_text": resolved_user_text,
-                "user_message": user_message,
-                "tool_name": tool_name,
-                "tool_arguments": tool_arguments,
-                "voice_preset": voice_preset,
-                "speak_reply": speak_reply,
-            }
-            self.emit(
-                {
-                    "type": "tool_proposed",
-                    "turnID": turn_id,
-                    "toolCallID": tool_call_id,
-                    "toolName": tool_name,
-                    "toolSummary": summary,
-                    "toolArguments": tool_arguments,
-                    "safetyClass": safety_class,
-                    "approvalState": approval_state,
-                    "executionState": execution_state,
-                }
-            )
-            if approval_state == "notRequired":
-                await self.resume_tool(turn_id, tool_call_id, approved=True)
-            return
-
-        await self.stream_assistant_text(turn_id, tool_plan.get("assistant_message", ""))
-        self.raise_if_turn_cancelled(turn_id)
-        self.history.extend(
-            [
-                user_message,
-                {"role": "assistant", "content": tool_plan.get("assistant_message", "")},
-            ]
-        )
-        if speak_reply:
-            await self.speak(turn_id, tool_plan.get("assistant_message", ""), voice_preset)
-        self.raise_if_turn_cancelled(turn_id)
-        self.emit_turn_finished(turn_id, status="finished", is_final=True)
 
     async def run_speech_turn(self, turn_id: str, text: str, voice_preset: str) -> None:
         if not text.strip():
@@ -1770,56 +1841,21 @@ class RuntimeHost:
 
     async def resume_tool(self, turn_id: str, tool_call_id: str, approved: bool) -> None:
         pending = self.pending_tools.pop(tool_call_id, None)
-        if not pending:
+        if pending is None:
             return
         self.raise_if_turn_cancelled(turn_id)
-        if not approved:
-            tool_result = "Tool execution was denied by the user."
-            self.emit(
-                {
-                    "type": "tool_finished",
-                    "turnID": turn_id,
-                    "toolCallID": tool_call_id,
-                    "executionState": "finished",
-                    "output": tool_result,
-                }
-            )
-        else:
-            self.emit({"type": "tool_started", "turnID": turn_id, "toolCallID": tool_call_id, "executionState": "running"})
-            try:
-                tool_result = await self.execute_tool(pending["tool_name"], pending["tool_arguments"])
-                self.raise_if_turn_cancelled(turn_id)
-                self.emit({"type": "tool_output", "turnID": turn_id, "toolCallID": tool_call_id, "output": tool_result})
-                self.emit({"type": "tool_finished", "turnID": turn_id, "toolCallID": tool_call_id, "executionState": "finished", "output": tool_result})
-            except Exception as exc:  # noqa: BLE001
-                if self.is_turn_cancelled(turn_id):
-                    raise
-                tool_result = f"Tool failed: {exc}"
-                self.emit({"type": "tool_finished", "turnID": turn_id, "toolCallID": tool_call_id, "executionState": "failed", "output": tool_result})
-
-        final_plan = await self.generate_followup_answer(
-            pending["user_message"],
-            pending["tool_name"],
-            pending["tool_arguments"],
-            tool_result,
-            turn_id=turn_id,
+        tool_result = await self.execute_pending_tool(
+            turn_id,
+            pending,
+            approved=approved,
         )
-        await self.stream_assistant_text(turn_id, final_plan.get("assistant_message", ""))
-        self.raise_if_turn_cancelled(turn_id)
-        self.history.extend(
-            [
-                pending["user_message"],
-                {"role": "assistant", "content": final_plan.get("assistant_message", "")},
-            ]
+        pending.loop_state.scratch_messages.append(
+            self.tool_response_message(tool_result)
         )
-        if pending["speak_reply"]:
-            await self.speak(
-                turn_id,
-                final_plan.get("assistant_message", ""),
-                pending["voice_preset"],
-            )
-        self.raise_if_turn_cancelled(turn_id)
-        self.emit_turn_finished(turn_id, status="finished", is_final=True)
+        pending.loop_state.next_tool_index += 1
+        completed = await self.execute_or_pause_tool_calls(pending.loop_state)
+        if completed:
+            await self.continue_agent_loop(pending.loop_state)
 
     async def execute_tool(self, tool_name: str, tool_arguments: dict[str, Any]) -> str:
         result = await self.mcp_client.call_tool(tool_name, tool_arguments)
@@ -1829,154 +1865,231 @@ class RuntimeHost:
         ]
         return "\n".join(filtered_lines).strip() or result.strip()
 
-    async def generate_agent_plan(
-        self,
-        user_message: dict[str, Any],
-        *,
-        turn_id: str,
-    ) -> dict[str, Any]:
-        await self.refresh_tool_definitions()
-        await self.warm_model("agent_model", {})
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a local macOS voice agent. "
-                    "Return strict JSON with keys assistant_message and tool_call. "
-                    "tool_call must be null or an object with name and arguments. "
-                    "Use at most one tool call. "
-                    "assistant_message may contain concise Markdown such as paragraphs, bullet lists, emphasis, inline code, and fenced code blocks when helpful. "
-                    "Only use the exact tool names and argument keys listed below.\n\n"
-                    f"{self.tool_planner_guide()}\n\n"
-                    "Rules:\n"
-                    "- Use get_scripting_tips only for discovery. Never call it with empty arguments. Prefer search_term for natural-language queries.\n"
-                    "- Use execute_script for concrete actions or live state lookups on this Mac. It can run AppleScript or JavaScript for Automation and is how you open apps, click UI, read state, and automate the Mac.\n"
-                    "- For requests to open or launch an app, prefer execute_script with AppleScript such as {\"script_content\": \"tell application \\\"Mail\\\" to activate\", \"language\": \"applescript\"}.\n"
-                    "- For current-machine questions like computer name, macOS version, chip, RAM, hostname, model, specs, or general questions about this Mac/computer, prefer execute_script with {\"script_content\": \"return system info\", \"language\": \"applescript\"}.\n"
-                    "- Do not claim you lack access to the user's computer details when the user is asking about this Mac. Inspect the machine with execute_script first, then answer from the live result.\n"
-                    "- Requests like 'tell me about my computer', 'what Mac is this', 'what are my specs', or 'how much RAM do I have' should trigger a live execute_script lookup, not a generic refusal.\n"
-                    "- If you choose execute_script, provide one of kb_script_id, script_content, or script_path.\n"
-                    "- If you set output_format_mode for execute_script, only use auto, human_readable, structured_error, structured_output_and_error, or direct. Prefer omitting it unless you need a specific format.\n"
-                    "- If the user asks for a direct explanation that does not require live macOS state or automation, set tool_call to null.\n"
-                    "- Keep assistant_message short when a tool will run.\n"
-                    "- The outer response must still be valid JSON even when assistant_message contains Markdown."
+    async def execute_or_pause_tool_calls(self, loop_state: PendingToolLoopState) -> bool:
+        while loop_state.next_tool_index < len(loop_state.pending_tool_calls):
+            self.raise_if_turn_cancelled(loop_state.turn_id)
+            tool_call = loop_state.pending_tool_calls[loop_state.next_tool_index]
+            tool_call_id = f"tool-{uuid.uuid4()}"
+            safety_class, approval_state, execution_state = self.classify_tool(
+                tool_call.name,
+                tool_call.arguments,
+            )
+            summary = f"{tool_call.name} • {approval_state.replace('_', ' ')}"
+            self.emit(
+                {
+                    "type": "tool_proposed",
+                    "turnID": loop_state.turn_id,
+                    "toolCallID": tool_call_id,
+                    "toolName": tool_call.name,
+                    "toolSummary": summary,
+                    "toolArguments": tool_call.arguments,
+                    "safetyClass": safety_class,
+                    "approvalState": approval_state,
+                    "executionState": execution_state,
+                }
+            )
+            if approval_state != "notRequired":
+                self.pending_tools[tool_call_id] = PendingToolApproval(
+                    turn_id=loop_state.turn_id,
+                    loop_state=loop_state,
+                    tool_call_id=tool_call_id,
+                    tool_call=tool_call,
+                )
+                return False
+
+            tool_result = await self.execute_pending_tool(
+                loop_state.turn_id,
+                PendingToolApproval(
+                    turn_id=loop_state.turn_id,
+                    loop_state=loop_state,
+                    tool_call_id=tool_call_id,
+                    tool_call=tool_call,
                 ),
+                approved=True,
+            )
+            loop_state.scratch_messages.append(self.tool_response_message(tool_result))
+            loop_state.next_tool_index += 1
+
+        loop_state.pending_tool_calls = []
+        loop_state.next_tool_index = 0
+        return True
+
+    async def execute_pending_tool(
+        self,
+        turn_id: str,
+        pending: PendingToolApproval,
+        *,
+        approved: bool,
+    ) -> str:
+        tool_call = pending.tool_call
+        if not approved:
+            tool_result = "Tool execution was denied by the user."
+            self.emit(
+                {
+                    "type": "tool_finished",
+                    "turnID": turn_id,
+                    "toolCallID": pending.tool_call_id,
+                    "executionState": "finished",
+                    "output": tool_result,
+                }
+            )
+            return tool_result
+
+        self.emit(
+            {
+                "type": "tool_started",
+                "turnID": turn_id,
+                "toolCallID": pending.tool_call_id,
+                "executionState": "running",
             }
-        ]
-        messages.extend(self.history[-6:])
-        messages.append(user_message)
-        return await self.generate_json(
+        )
+        try:
+            tool_result = await self.execute_tool(tool_call.name, tool_call.arguments)
+            self.raise_if_turn_cancelled(turn_id)
+            self.emit(
+                {
+                    "type": "tool_output",
+                    "turnID": turn_id,
+                    "toolCallID": pending.tool_call_id,
+                    "output": tool_result,
+                }
+            )
+            self.emit(
+                {
+                    "type": "tool_finished",
+                    "turnID": turn_id,
+                    "toolCallID": pending.tool_call_id,
+                    "executionState": "finished",
+                    "output": tool_result,
+                }
+            )
+            return tool_result
+        except Exception as exc:  # noqa: BLE001
+            if self.is_turn_cancelled(turn_id):
+                raise
+            tool_result = f"Tool failed: {exc}"
+            self.emit(
+                {
+                    "type": "tool_finished",
+                    "turnID": turn_id,
+                    "toolCallID": pending.tool_call_id,
+                    "executionState": "failed",
+                    "output": tool_result,
+                }
+            )
+            return tool_result
+
+    def tool_response_message(self, tool_result: str) -> dict[str, Any]:
+        return {
+            "role": "user",
+            "content": f"<tool_response>\n{tool_result.strip()}\n</tool_response>",
+        }
+
+    def agent_loop_system_prompt(self) -> str:
+        return (
+            "You are a local macOS assistant. "
+            "Use the available tools whenever live machine state, app state, files, or automation are required. "
+            "If tools are unnecessary, answer directly in concise Markdown. "
+            "Do not mention internal tool syntax or hidden reasoning."
+        )
+
+    def qwen_tool_schemas(self) -> list[dict[str, Any]]:
+        schemas: list[dict[str, Any]] = []
+        for tool in sorted(self.tool_definitions.values(), key=lambda tool: tool.name):
+            parameters = tool.input_schema if isinstance(tool.input_schema, dict) else {}
+            if not parameters:
+                parameters = {"type": "object", "properties": {}}
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": parameters,
+                    },
+                }
+            )
+        return schemas
+
+    async def generate_assistant_step(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tool_schemas: list[dict[str, Any]],
+        turn_id: str,
+    ) -> AssistantStepResult:
+        await self.warm_model("agent_model", {})
+        raw = await self.generate_text(
             messages,
             turn_id=turn_id,
             enable_thinking=False,
             task_profile="reasoning",
-            max_tokens=384,
+            max_tokens=768,
+            tools=tool_schemas,
         )
+        return self.parse_assistant_step_output(raw, tool_schemas)
 
-    async def generate_followup_answer(
+    def parse_assistant_step_output(
         self,
-        user_message: dict[str, Any],
-        tool_name: str,
-        tool_arguments: dict[str, Any],
-        tool_result: str,
-        *,
-        turn_id: str,
-    ) -> dict[str, Any]:
-        await self.warm_model("agent_model", {})
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a local macOS voice agent. "
-                    "Return strict JSON with keys assistant_message and tool_call. "
-                    "tool_call must be null. "
-                    "assistant_message may contain concise Markdown such as paragraphs, bullet lists, emphasis, inline code, and fenced code blocks when helpful. "
-                    "Summarize the completed tool result clearly."
-                ),
-            },
-        ]
-        messages.extend(self.history[-6:])
-        messages.extend(
-            [
-                user_message,
-            {
-                "role": "assistant",
-                "content": (
-                    f"Tool {tool_name} was executed with arguments {json.dumps(tool_arguments)}.\n"
-                    f"Tool result:\n{tool_result}"
-                ),
-            },
-            ]
-        )
-        return await self.generate_json(
-            messages,
-            turn_id=turn_id,
-            enable_thinking=False,
-            task_profile="general",
-            max_tokens=512,
-        )
+        raw: str,
+        tool_schemas: list[dict[str, Any]],
+    ) -> AssistantStepResult:
+        tokenizer = self.agent_tokenizer
+        if tokenizer is None:
+            raise self.agent_template_setup_error(
+                "The local Qwen tokenizer/parser is unavailable for tool-call parsing."
+            )
 
-    async def generate_direct_answer(
-        self,
-        user_message: dict[str, Any],
-        *,
-        turn_id: str,
-    ) -> str:
-        await self.warm_model("agent_model", {})
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a local macOS assistant. "
-                    "Answer the user's request directly and concisely in Markdown. "
-                    "Use the conversation context when relevant. "
-                    "Do not invent live macOS state or claim you performed an action."
-                ),
-            },
-        ]
-        messages.extend(self.history[-6:])
-        messages.append(user_message)
-        return await self.generate_text(
-            messages,
-            turn_id=turn_id,
-            enable_thinking=False,
-            task_profile="general",
-            max_tokens=512,
-            on_chunk=lambda chunk: self.emit(
-                {
-                    "type": "assistant_delta",
-                    "turnID": turn_id,
-                    "text": chunk,
-                }
-            ),
-        )
+        tool_call_start = tokenizer.tool_call_start
+        tool_call_end = tokenizer.tool_call_end or ""
+        tool_texts: list[str] = []
+        text_parts: list[str] = []
+        cursor = 0
 
-    async def generate_json(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        turn_id: str,
-        enable_thinking: bool,
-        task_profile: str,
-        max_tokens: int,
-    ) -> dict[str, Any]:
-        raw = await self.generate_text(
-            messages,
-            turn_id=turn_id,
-            enable_thinking=enable_thinking,
-            task_profile=task_profile,
-            max_tokens=max_tokens,
+        while tool_call_start:
+            start_index = raw.find(tool_call_start, cursor)
+            if start_index == -1:
+                break
+            text_parts.append(raw[cursor:start_index])
+            tool_content_start = start_index + len(tool_call_start)
+            if tool_call_end:
+                end_index = raw.find(tool_call_end, tool_content_start)
+                if end_index == -1:
+                    raise RuntimeError("The Qwen agent emitted an unterminated tool call.")
+                tool_texts.append(raw[tool_content_start:end_index])
+                cursor = end_index + len(tool_call_end)
+            else:
+                tool_texts.append(raw[tool_content_start:])
+                cursor = len(raw)
+                break
+
+        text_parts.append(raw[cursor:])
+        visible_text = "".join(text_parts).strip()
+
+        parsed_tool_calls: list[ToolCallRequest] = []
+        for tool_text in tool_texts:
+            parsed = tokenizer.tool_parser(tool_text, tool_schemas)
+            candidates = parsed if isinstance(parsed, list) else [parsed]
+            for candidate in candidates:
+                parsed_tool_calls.append(self.normalize_generated_tool_call(candidate))
+
+        return AssistantStepResult(text=visible_text, tool_calls=parsed_tool_calls)
+
+    def normalize_generated_tool_call(self, value: Any) -> ToolCallRequest:
+        if not isinstance(value, dict):
+            raise RuntimeError(f"Unexpected Qwen tool-call payload: {value!r}")
+        name = value.get("name")
+        arguments = value.get("arguments") or {}
+        if not isinstance(name, str) or not name.strip():
+            raise RuntimeError(f"Qwen emitted a tool call without a valid function name: {value!r}")
+        if name not in self.available_tool_names:
+            raise RuntimeError(f"Qwen requested unavailable tool '{name}'.")
+        if not isinstance(arguments, dict):
+            raise RuntimeError(f"Qwen emitted invalid arguments for tool '{name}': {value!r}")
+        return ToolCallRequest(
+            name=name,
+            arguments=self.sanitize_tool_arguments(name, arguments),
         )
-        raw = raw.strip()
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start != -1 and end != -1:
-            raw = raw[start : end + 1]
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            parsed = {"assistant_message": raw, "tool_call": None}
-        return self.normalize_generation_payload(parsed, raw)
 
     async def generate_text(
         self,
@@ -1986,6 +2099,7 @@ class RuntimeHost:
         enable_thinking: bool,
         task_profile: str,
         max_tokens: int,
+        tools: list[dict[str, Any]] | None = None,
         on_chunk: Callable[[str], None] | None = None,
     ) -> str:
         from mlx_vlm import stream_generate
@@ -2004,6 +2118,7 @@ class RuntimeHost:
             add_generation_prompt=True,
             tokenize=False,
             enable_thinking=enable_thinking,
+            tools=tools,
         )
         cancel_event = self.turn_cancel_event(turn_id)
         queue_items: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
@@ -2067,13 +2182,29 @@ class RuntimeHost:
             return []
         return [match.group(0) for match in re.finditer(r"\s+|\S+", text)]
 
-    async def stream_assistant_text(self, turn_id: str, text: str) -> None:
+    async def stream_assistant_text(
+        self,
+        turn_id: str,
+        text: str,
+        *,
+        assistant_segment_id: str | None = None,
+        is_final_segment: bool | None = None,
+    ) -> None:
         chunks = self.assistant_stream_chunks(text)
         if not chunks:
             return
-        for chunk in chunks:
+        for index, chunk in enumerate(chunks):
             self.raise_if_turn_cancelled(turn_id)
-            self.emit({"type": "assistant_delta", "turnID": turn_id, "text": chunk})
+            payload: dict[str, Any] = {
+                "type": "assistant_delta",
+                "turnID": turn_id,
+                "text": chunk,
+            }
+            if assistant_segment_id is not None:
+                payload["assistantSegmentID"] = assistant_segment_id
+            if index == len(chunks) - 1 and is_final_segment is not None:
+                payload["isFinalSegment"] = is_final_segment
+            self.emit(payload)
             await asyncio.sleep(0.025)
 
     async def speak(self, turn_id: str, text: str, voice_preset: str) -> None:
@@ -2342,62 +2473,6 @@ class RuntimeHost:
         self.emit({"type": "bootstrap_progress", "stage": "Shutting down runtime", "message": "Stopped local models and background automation services."})
         self.should_exit = True
 
-    def normalize_generation_payload(self, parsed: Any, raw: str) -> dict[str, Any]:
-        if isinstance(parsed, dict):
-            payload = dict(parsed)
-        elif isinstance(parsed, str):
-            payload = {"assistant_message": parsed, "tool_call": None}
-        else:
-            payload = {"assistant_message": raw, "tool_call": None}
-
-        payload["assistant_message"] = self.normalize_assistant_message(payload.get("assistant_message"))
-        payload["tool_call"] = self.normalize_tool_call(payload.get("tool_call"), payload)
-        return payload
-
-    @staticmethod
-    def normalize_assistant_message(value: Any) -> str:
-        if isinstance(value, str):
-            return value.strip()
-        if value is None:
-            return ""
-        if isinstance(value, (dict, list)):
-            return json.dumps(value)
-        return str(value)
-
-    def normalize_tool_call(self, value: Any, payload: dict[str, Any]) -> dict[str, Any] | None:
-        sibling_arguments = payload.get("tool_arguments")
-        if sibling_arguments is None:
-            sibling_arguments = payload.get("arguments")
-
-        if isinstance(value, str):
-            name = value.strip()
-            if not name or name.lower() in {"null", "none", "false"}:
-                return None
-            if name not in self.available_tool_names:
-                return None
-            arguments = sibling_arguments if isinstance(sibling_arguments, dict) else {}
-            return {"name": name, "arguments": self.sanitize_tool_arguments(name, arguments)}
-
-        if not isinstance(value, dict):
-            return None
-
-        name = value.get("name") or value.get("tool_name")
-        if not isinstance(name, str):
-            return None
-        name = name.strip()
-        if name not in self.available_tool_names:
-            return None
-
-        arguments = value.get("arguments")
-        if arguments is None:
-            arguments = value.get("tool_arguments")
-        if arguments is None and isinstance(sibling_arguments, dict):
-            arguments = sibling_arguments
-        if not isinstance(arguments, dict):
-            arguments = {}
-
-        return {"name": name, "arguments": self.sanitize_tool_arguments(name, arguments)}
-
     def classify_tool(self, tool_name: str, tool_arguments: dict[str, Any]) -> tuple[str, str, str]:
         if tool_name in READ_ONLY_TOOL_NAMES:
             return ("readOnly", "notRequired", "proposed")
@@ -2414,153 +2489,6 @@ class RuntimeHost:
             return
         tools = await self.mcp_client.list_tools()
         self.tool_definitions = {tool.name: tool for tool in tools}
-
-    def tool_planner_guide(self) -> str:
-        if not self.tool_definitions:
-            return (
-                "Available tools:\n"
-                "- get_scripting_tips(search_term?, category?, list_categories?, refresh_database?, limit?) for discovery only.\n"
-                "- execute_script(kb_script_id? | script_content? | script_path?, language?, arguments?, input_data?, timeout_seconds?) for actual execution."
-            )
-
-        lines = ["Live MCP tools:"]
-        for name in sorted(self.tool_definitions):
-            tool = self.tool_definitions[name]
-            properties = tool.input_schema.get("properties", {}) if isinstance(tool.input_schema, dict) else {}
-            property_names = ", ".join(sorted(properties.keys()))
-            lines.append(f"- {name}({property_names})")
-            if name == "get_scripting_tips":
-                lines.append("  Use for discovery only. search_term is the normal way to query it.")
-            elif name == "execute_script":
-                lines.append("  Use for live actions or state lookups. One of kb_script_id, script_content, or script_path is required.")
-                lines.append('  AppleScript example for opening Mail: {"script_content": "tell application \\"Mail\\" to activate", "language": "applescript"}')
-        return "\n".join(lines)
-
-    def choose_tool_call(self, user_text: str, tool_plan: dict[str, Any]) -> dict[str, Any] | None:
-        proposed = tool_plan.get("tool_call")
-        if isinstance(proposed, dict):
-            name = proposed.get("name")
-            arguments = proposed.get("arguments") or {}
-            if isinstance(name, str):
-                repaired = self.repair_tool_call(name, arguments, user_text)
-                if repaired is not None:
-                    return repaired
-        return self.direct_tool_call_for_user_text(user_text)
-
-    def direct_tool_call_for_user_text(self, user_text: str) -> dict[str, Any] | None:
-        app_launch = self.app_activation_tool_call(user_text)
-        if app_launch is not None:
-            return app_launch
-        return self.system_info_tool_call(user_text)
-
-    def should_use_tool_planner(self, user_text: str, attachments: list[dict[str, Any]]) -> bool:
-        if attachments:
-            return True
-        if self.direct_tool_call_for_user_text(user_text) is not None:
-            return False
-
-        text = user_text.strip().lower()
-        if not text:
-            return False
-        if self.is_automation_discovery_request(user_text):
-            return True
-
-        imperative_prefixes = (
-            "open ",
-            "launch ",
-            "start ",
-            "close ",
-            "quit ",
-            "click ",
-            "tap ",
-            "press ",
-            "type ",
-            "paste ",
-            "copy ",
-            "move ",
-            "drag ",
-            "drop ",
-            "scroll ",
-            "select ",
-            "choose ",
-            "enable ",
-            "disable ",
-            "turn ",
-            "set ",
-            "rename ",
-            "create ",
-            "delete ",
-            "remove ",
-            "save ",
-            "download ",
-            "upload ",
-            "install ",
-            "uninstall ",
-            "send ",
-            "reply ",
-            "compose ",
-            "switch ",
-            "focus ",
-            "check ",
-            "inspect ",
-            "read ",
-            "show ",
-            "take ",
-        )
-        if any(text.startswith(prefix) for prefix in imperative_prefixes):
-            return True
-
-        tool_hint_terms = (
-            " on my mac",
-            " on this mac",
-            " on my computer",
-            " screenshot",
-            " screen shot",
-            " clipboard",
-            " finder",
-            " safari",
-            " chrome",
-            " mail",
-            " messages",
-            " notes",
-            " calendar",
-            " system settings",
-            " window",
-            " tab",
-            " folder",
-            " file",
-            " desktop",
-            " downloads",
-            " documents",
-            " application",
-            " app ",
-        )
-        return any(term in text for term in tool_hint_terms)
-
-    def repair_tool_call(self, name: str, arguments: dict[str, Any], user_text: str) -> dict[str, Any] | None:
-        if name not in self.available_tool_names:
-            return self.system_info_tool_call(user_text)
-
-        arguments = self.sanitize_tool_arguments(name, arguments)
-        if name == "get_scripting_tips":
-            if not arguments:
-                if self.is_automation_discovery_request(user_text):
-                    arguments = {"search_term": user_text, "limit": 5}
-                else:
-                    return self.system_info_tool_call(user_text)
-            if not any(key in arguments for key in ("search_term", "category", "list_categories", "refresh_database")):
-                if self.is_automation_discovery_request(user_text):
-                    arguments["search_term"] = user_text
-                else:
-                    return None
-            return {"name": name, "arguments": arguments}
-
-        if name == "execute_script":
-            if not any(arguments.get(key) for key in ("kb_script_id", "script_content", "script_path")):
-                return self.system_info_tool_call(user_text)
-            return {"name": name, "arguments": arguments}
-
-        return None
 
     def sanitize_tool_arguments(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         sanitized = dict(arguments)
@@ -2689,121 +2617,6 @@ class RuntimeHost:
 
         return None
 
-    @staticmethod
-    def is_automation_discovery_request(user_text: str) -> bool:
-        text = user_text.lower()
-        automation_terms = [
-            "open ",
-            "close ",
-            "launch ",
-            "click ",
-            "type ",
-            "press ",
-            "finder",
-            "safari",
-            "chrome",
-            "mail",
-            "calendar",
-            "notes",
-            "script",
-            "automation",
-        ]
-        return any(term in text for term in automation_terms)
-
-    @staticmethod
-    def system_info_tool_call(user_text: str) -> dict[str, Any] | None:
-        text = user_text.lower()
-        triggers = [
-            "what computer am i on",
-            "what mac am i on",
-            "what machine am i on",
-            "tell me about my computer",
-            "tell me about this computer",
-            "tell me about my mac",
-            "tell me about this mac",
-            "about my computer",
-            "about this computer",
-            "about my mac",
-            "about this mac",
-            "my computer specs",
-            "my mac specs",
-            "computer specs",
-            "mac specs",
-            "computer details",
-            "mac details",
-            "system specs",
-            "system details",
-            "what are my specs",
-            "what are this computer specs",
-            "what mac is this",
-            "what computer is this",
-            "what kind of computer is this",
-            "computer name",
-            "hostname",
-            "host name",
-            "system version",
-            "macos version",
-            "what version of macos",
-            "what chip",
-            "what processor",
-            "how much memory",
-            "how much ram",
-            "serial number",
-            "model identifier",
-        ]
-        if not any(trigger in text for trigger in triggers):
-            return None
-        return {
-            "name": "execute_script",
-            "arguments": {
-                "script_content": SYSTEM_INFO_SCRIPT,
-                "language": "applescript",
-            },
-        }
-
-    @staticmethod
-    def app_activation_tool_call(user_text: str) -> dict[str, Any] | None:
-        match = re.match(
-            r"^\s*(?:please\s+)?(?:open|launch|start)\s+(?:the\s+)?(?P<app>.+?)(?:\s+(?:app|application))?\s*[.!?]?\s*$",
-            user_text,
-            flags=re.IGNORECASE,
-        )
-        if not match:
-            return None
-
-        raw_app_name = match.group("app").strip()
-        if not raw_app_name:
-            return None
-
-        lowered = raw_app_name.lower()
-        blocked_fragments = {"window", "folder", "file", "message", "email", "mailbox", "tab", "website"}
-        if any(fragment in lowered for fragment in blocked_fragments):
-            return None
-
-        aliases = {
-            "mail": "Mail",
-            "email": "Mail",
-            "emails": "Mail",
-            "finder": "Finder",
-            "safari": "Safari",
-            "messages": "Messages",
-            "notes": "Notes",
-            "calendar": "Calendar",
-            "music": "Music",
-            "chrome": "Google Chrome",
-            "google chrome": "Google Chrome",
-        }
-        app_name = aliases.get(lowered, " ".join(word.capitalize() for word in raw_app_name.split()))
-        escaped_app_name = app_name.replace('"', '\\"')
-
-        return {
-            "name": "execute_script",
-            "arguments": {
-                "script_content": f'tell application "{escaped_app_name}" to activate',
-                "language": "applescript",
-            },
-        }
-
     def emit_model_state(
         self,
         model_id: str,
@@ -2863,6 +2676,44 @@ class RuntimeHost:
                 "The local runtime has an incompatible bundled mistral-common package required by the Qwen image processor "
                 "(missing ReasoningEffort support). Relaunch MacAssistant to refresh the runtime packages. "
                 "If this keeps happening, delete ~/Library/Application Support/MacAssistant/runtime and relaunch."
+            )
+
+    @staticmethod
+    def agent_template_setup_error(message: str) -> RuntimeError:
+        return RuntimeError(
+            f"{message} Reinstall or refresh the local agent model/runtime and relaunch MacAssistant."
+        )
+
+    def assert_agent_tool_template(self, model_path: Path) -> None:
+        processor = self.agent_processor
+        tokenizer = self.agent_tokenizer
+        if processor is None or tokenizer is None:
+            raise self.agent_template_setup_error(
+                "The local Qwen agent model did not load the expected processor/tokenizer pair."
+            )
+
+        processor_chat_template = getattr(processor, "chat_template", None)
+        if not processor_chat_template and hasattr(processor, "tokenizer"):
+            processor_chat_template = getattr(processor.tokenizer, "chat_template", None)
+        if not isinstance(processor_chat_template, str) or not processor_chat_template.strip():
+            raise self.agent_template_setup_error(
+                f"The installed agent model at {model_path} is missing its bundled Qwen chat template."
+            )
+        if "<tool_call>" not in processor_chat_template or "<tool_response>" not in processor_chat_template:
+            raise self.agent_template_setup_error(
+                f"The installed agent model at {model_path} does not expose the expected Qwen tool-calling template."
+            )
+        if not getattr(tokenizer, "has_chat_template", False):
+            raise self.agent_template_setup_error(
+                f"The installed agent model at {model_path} is missing tokenizer chat-template support."
+            )
+        if not getattr(tokenizer, "has_tool_calling", False):
+            raise self.agent_template_setup_error(
+                f"The installed agent model at {model_path} does not advertise tool-calling support."
+            )
+        if getattr(tokenizer, "tool_parser", None) is None:
+            raise self.agent_template_setup_error(
+                f"The installed agent model at {model_path} is missing the parser for its bundled Qwen tool format."
             )
 
     def normalize_attachments(self, attachments: Any) -> list[dict[str, Any]]:

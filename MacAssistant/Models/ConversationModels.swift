@@ -58,9 +58,11 @@ struct UserMessage: Identifiable, Equatable, Sendable {
 struct AssistantMessage: Identifiable, Equatable, Sendable {
     let id: UUID
     let turnID: String
+    let segmentID: String
     var text: String
     var isStreaming: Bool
     var isCancelled: Bool
+    var isFinalSegment: Bool
     var source: TurnSource
 }
 

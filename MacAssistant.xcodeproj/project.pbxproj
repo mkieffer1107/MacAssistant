@@ -12,6 +12,7 @@
 		20D8D4AE6AE39852E15AAEB0 /* AudioPlaybackService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 126A5A738B2A1C1A97582723 /* AudioPlaybackService.swift */; };
 		2409396868DD30BAA7842038 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C424EA90E96E45DBDAF97316 /* AppModel.swift */; };
 		28318AF05C082FEFE9CA2B0C /* SetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FCECCE678D142B8E5739B9E /* SetupView.swift */; };
+		3744374066B2222EB56EFC87 /* MicrophoneRouteCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A77E051E514F7DA5879DFFA6 /* MicrophoneRouteCoordinator.swift */; };
 		3C58D18F7DB8FECDED6194E9 /* MacAssistantApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AD5C8115BE3ABE4E1E89A15 /* MacAssistantApp.swift */; };
 		49D8F14F21FE6236DADB5E92 /* LoadingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 160B2D5F076DEED6393DBC25 /* LoadingView.swift */; };
 		7FC1C1E8AFA73CD97AA10B20 /* WindowAccessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7D37B1DB182A6648F0479C4 /* WindowAccessor.swift */; };
@@ -52,6 +53,7 @@
 		85B985E6E4D29515D5DC7F07 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
 		8918E743291CE94A6CBF754B /* JSONValue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONValue.swift; sourceTree = "<group>"; };
 		A04DE99F34D16ED9BD2547D5 /* AgentRuntimeClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRuntimeClient.swift; sourceTree = "<group>"; };
+		A77E051E514F7DA5879DFFA6 /* MicrophoneRouteCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MicrophoneRouteCoordinator.swift; sourceTree = "<group>"; };
 		C424EA90E96E45DBDAF97316 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
 		D7F68849AD6507645F60973D /* MacAssistant.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MacAssistant.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		F5DC30E4BB0F4E09D1296AF0 /* MicrophoneCaptureService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MicrophoneCaptureService.swift; sourceTree = "<group>"; };
@@ -157,6 +159,7 @@
 				C424EA90E96E45DBDAF97316 /* AppModel.swift */,
 				126A5A738B2A1C1A97582723 /* AudioPlaybackService.swift */,
 				F5DC30E4BB0F4E09D1296AF0 /* MicrophoneCaptureService.swift */,
+				A77E051E514F7DA5879DFFA6 /* MicrophoneRouteCoordinator.swift */,
 				045D5C33B0510A4FE9EAD2E1 /* RuntimeProtocol.swift */,
 			);
 			path = Services;
@@ -292,6 +295,7 @@
 				49D8F14F21FE6236DADB5E92 /* LoadingView.swift in Sources */,
 				3C58D18F7DB8FECDED6194E9 /* MacAssistantApp.swift in Sources */,
 				12FBE45C906EBC33DF641011 /* MicrophoneCaptureService.swift in Sources */,
+				3744374066B2222EB56EFC87 /* MicrophoneRouteCoordinator.swift in Sources */,
 				A9F0347498FB45CAB9044646 /* ModelState.swift in Sources */,
 				CBA17252246A72A20F66DE0F /* RootView.swift in Sources */,
 				108333BE64E44CDFBE26475C /* RuntimeProtocol.swift in Sources */,

@@ -71,6 +71,7 @@ struct RuntimeEventEnvelope: Codable, Sendable {
     let message: String?
     let stage: String?
     let text: String?
+    let assistantSegmentID: String?
     let progress: Double?
     let bytesDownloaded: Int64?
     let bytesTotal: Int64?
@@ -90,6 +91,7 @@ struct RuntimeEventEnvelope: Codable, Sendable {
     let output: String?
     let status: String?
     let isFinal: Bool?
+    let isFinalSegment: Bool?
 
     init(
         type: String,
@@ -101,6 +103,7 @@ struct RuntimeEventEnvelope: Codable, Sendable {
         message: String? = nil,
         stage: String? = nil,
         text: String? = nil,
+        assistantSegmentID: String? = nil,
         progress: Double? = nil,
         bytesDownloaded: Int64? = nil,
         bytesTotal: Int64? = nil,
@@ -119,7 +122,8 @@ struct RuntimeEventEnvelope: Codable, Sendable {
         executionState: String? = nil,
         output: String? = nil,
         status: String? = nil,
-        isFinal: Bool? = nil
+        isFinal: Bool? = nil,
+        isFinalSegment: Bool? = nil
     ) {
         self.type = type
         self.turnID = turnID
@@ -130,6 +134,7 @@ struct RuntimeEventEnvelope: Codable, Sendable {
         self.message = message
         self.stage = stage
         self.text = text
+        self.assistantSegmentID = assistantSegmentID
         self.progress = progress
         self.bytesDownloaded = bytesDownloaded
         self.bytesTotal = bytesTotal
@@ -149,6 +154,7 @@ struct RuntimeEventEnvelope: Codable, Sendable {
         self.output = output
         self.status = status
         self.isFinal = isFinal
+        self.isFinalSegment = isFinalSegment
     }
 }
 
