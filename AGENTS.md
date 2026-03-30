@@ -41,6 +41,7 @@ This file applies to the entire repository.
 - If you change app look and feel, inspect `MacAssistant/Utilities/AppTheme.swift` first.
 - Do not hand-edit `dist/` unless release packaging is part of the task. Rebuild it through `./build.sh`.
 - Do not hand-edit `MacAssistant.xcodeproj` unless regeneration is impossible for the task. Prefer `xcodegen generate`.
+- For local Debug runs, prefer `./run-debug.sh` or pass `-derivedDataPath "$PWD/.derivedData"` to `xcodebuild` and launch `$PWD/.derivedData/Build/Products/Debug/MacAssistant.app` directly. Do not use `open "$(find ~/Library/Developer/Xcode/DerivedData ...)"`, because it can reopen a stale app bundle from a different DerivedData folder.
 - Do not delete downloaded models or the user's `~/Library/Application Support/MacAssistant/` runtime state unless the user explicitly asks for that.
 
 ## Runtime Notes
@@ -57,7 +58,7 @@ This file applies to the entire repository.
 - Tool execution is routed through `@steipete/macos-automator-mcp`.
 - The main installables are `voice_pack` (`stt_model` + `tts_model`) and `agent_model`.
 - The agent path is multimodal. Text-only chat still runs through the same agent model unless routing explicitly shortcuts planner work.
-- Live voice capture is session-scoped. `MicrophoneCaptureService` creates a fresh audio engine/converter per recording and should be fully reset on every stop or failure.
+- Live voice capture is session-scoped. `MicrophoneCaptureService` creates a fresh capture session/converter per recording and should be fully reset on every stop or failure.
 - Realtime STT is streamed through the existing NDJSON events. The app should open `start_recording` only after the first captured mic chunk, stream `append_audio_chunk` while speaking, use cumulative `transcript_delta` text for the draft bubble, and reserve `transcript_final` for commit/finalization.
 - Recording controls are intentionally asymmetric:
   - send during recording finalizes and submits the live voice draft
@@ -69,9 +70,11 @@ This file applies to the entire repository.
 Run the smallest relevant checks for the change:
 
 - Swift app tests:
-  - `xcodebuild -project MacAssistant.xcodeproj -scheme MacAssistant -destination 'platform=macOS' test`
+  - `xcodebuild -project MacAssistant.xcodeproj -scheme MacAssistant -derivedDataPath "$PWD/.derivedData" -destination 'platform=macOS' test`
 - Swift app build:
-  - `xcodebuild -project MacAssistant.xcodeproj -scheme MacAssistant -configuration Debug build`
+  - `xcodebuild -project MacAssistant.xcodeproj -scheme MacAssistant -configuration Debug -derivedDataPath "$PWD/.derivedData" build`
+- Local Debug build, test, and launch:
+  - `./run-debug.sh`
 - Python runtime tests:
   - `python3 -m unittest Runtime/tests/test_agent_runtime_host.py`
 - Voice/STT-focused runtime streaming checks:

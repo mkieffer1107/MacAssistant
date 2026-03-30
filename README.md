@@ -32,10 +32,31 @@ Native macOS Tahoe 26 SwiftUI app for a local voice-first automation assistant.
 ## Build
 
 ```bash
+DERIVED_DATA="$PWD/.derivedData"
+
 xcodegen generate
-xcodebuild -scheme MacAssistant -project MacAssistant.xcodeproj -configuration Debug build
-xcodebuild -scheme MacAssistant -project MacAssistant.xcodeproj -configuration Debug test
+xcodebuild \
+  -project MacAssistant.xcodeproj \
+  -scheme MacAssistant \
+  -configuration Debug \
+  -derivedDataPath "$DERIVED_DATA" \
+  build
+xcodebuild \
+  -project MacAssistant.xcodeproj \
+  -scheme MacAssistant \
+  -configuration Debug \
+  -derivedDataPath "$DERIVED_DATA" \
+  -destination 'platform=macOS' \
+  test
 ```
+
+To build, test, stop any existing app instance, and launch the exact Debug app you just built:
+
+```bash
+./run-debug.sh
+```
+
+The script uses the repo-local `.derivedData/` directory so the launch path is stable. Do not use `open "$(find ~/Library/Developer/Xcode/DerivedData ...)"` for Debug runs, because it can reopen an older app bundle from a different DerivedData folder.
 
 ## Release
 
@@ -82,7 +103,7 @@ open MacAssistant.xcodeproj
 
 To launch the app:
 ```bash
-open "$(find ~/Library/Developer/Xcode/DerivedData -path '*/Build/Products/Debug/MacAssistant.app' -print -quit)"
+open -n "$PWD/.derivedData/Build/Products/Debug/MacAssistant.app"
 ```
 
 

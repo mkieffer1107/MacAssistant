@@ -1373,6 +1373,8 @@ class SequentialToolLoopTests(unittest.IsolatedAsyncioTestCase):
                 if self.step_calls == 1:
                     self.step_calls += 1
                     assert "Tool failed: temporary failure" in messages[-1]["content"]
+                    assert "The task is still unresolved." in messages[-1]["content"]
+                    assert "continue with a corrected tool call" in messages[-1]["content"]
                     return runtime_host.AssistantStepResult(
                         text="Retrying with the tool output in mind.",
                         tool_calls=[
@@ -1419,6 +1421,118 @@ class SequentialToolLoopTests(unittest.IsolatedAsyncioTestCase):
                 {"role": "assistant", "content": "All set."},
             ],
         )
+
+    async def test_script_syntax_failure_keeps_retry_guidance_in_tool_response(self) -> None:
+        class SyntaxRetryHost(TestRuntimeHost):
+            def __init__(self) -> None:
+                super().__init__()
+                self.step_calls = 0
+
+            def classify_tool(
+                self,
+                tool_name: str,
+                tool_arguments: dict[str, object],
+            ) -> tuple[str, str, str]:
+                return ("readOnly", "notRequired", "proposed")
+
+            async def generate_assistant_step(
+                self,
+                messages: list[dict[str, object]],
+                *,
+                tool_schemas: list[dict[str, object]],
+                turn_id: str,
+            ) -> runtime_host.AssistantStepResult:
+                if self.step_calls == 0:
+                    self.step_calls += 1
+                    return runtime_host.AssistantStepResult(
+                        text="Trying AppleScript first.",
+                        tool_calls=[
+                            runtime_host.ToolCallRequest(
+                                name="execute_script",
+                                arguments={"script_content": "broken applescript", "language": "applescript"},
+                            )
+                        ],
+                    )
+
+                assert "syntax error" in messages[-1]["content"]
+                assert "The task is still unresolved." in messages[-1]["content"]
+                assert "Prefer corrected local app automation" in messages[-1]["content"]
+                return runtime_host.AssistantStepResult(text="Retrying with a corrected script.", tool_calls=[])
+
+            async def execute_tool(
+                self,
+                tool_name: str,
+                tool_arguments: dict[str, object],
+            ) -> str:
+                raise RuntimeError("35:36: syntax error")
+
+        host = SyntaxRetryHost()
+
+        await host.run_turn(
+            turn_id="syntax-turn",
+            user_text="Read my latest mail",
+            attachments=[],
+            speak_reply=False,
+            voice_preset="casual_male",
+        )
+
+        self.assertEqual(host.history[-1], {"role": "assistant", "content": "Retrying with a corrected script."})
+
+    async def test_shell_command_failure_keeps_retry_guidance_in_tool_response(self) -> None:
+        class ShellRetryHost(TestRuntimeHost):
+            def __init__(self) -> None:
+                super().__init__()
+                self.step_calls = 0
+
+            def classify_tool(
+                self,
+                tool_name: str,
+                tool_arguments: dict[str, object],
+            ) -> tuple[str, str, str]:
+                return ("readOnly", "notRequired", "proposed")
+
+            async def generate_assistant_step(
+                self,
+                messages: list[dict[str, object]],
+                *,
+                tool_schemas: list[dict[str, object]],
+                turn_id: str,
+            ) -> runtime_host.AssistantStepResult:
+                if self.step_calls == 0:
+                    self.step_calls += 1
+                    return runtime_host.AssistantStepResult(
+                        text="Trying the browser automation.",
+                        tool_calls=[
+                            runtime_host.ToolCallRequest(
+                                name="execute_script",
+                                arguments={"script_content": "bad shell usage", "language": "applescript"},
+                            )
+                        ],
+                    )
+
+                assert "command not found" in messages[-1]["content"]
+                assert "continue with a corrected tool call" in messages[-1]["content"]
+                assert "Only stop without another tool call" in messages[-1]["content"]
+                return runtime_host.AssistantStepResult(text="Retrying with corrected browser automation.", tool_calls=[])
+
+            async def execute_tool(
+                self,
+                tool_name: str,
+                tool_arguments: dict[str, object],
+            ) -> str:
+                raise RuntimeError("sh: google: command not found (127)")
+
+        host = ShellRetryHost()
+
+        await host.run_turn(
+            turn_id="shell-turn",
+            user_text="Search in Safari",
+            attachments=[],
+            speak_reply=False,
+            voice_preset="casual_male",
+        )
+
+        self.assertEqual(host.history[-1], {"role": "assistant", "content": "Retrying with corrected browser automation."})
 
     async def test_multi_step_loop_runs_until_no_tool_call_remains(self) -> None:
         class MultiStepHost(TestRuntimeHost):

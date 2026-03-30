@@ -24,12 +24,13 @@ final class AgentRuntimeClient: RuntimeClienting {
     private(set) var lastSentCommand: RuntimeCommandEnvelope?
 
     private let appSupportURL: URL
+    private let launchLogWriter: RuntimeLaunchLogWriter
     private var process: Process?
     private var stdinHandle: FileHandle?
     private var stdoutHandle: FileHandle?
     private var stderrHandle: FileHandle?
-    private var stdoutBuffer = Data()
-    private var stderrBuffer = Data()
+    private lazy var outputPump = RuntimeOutputPump(logWriter: launchLogWriter)
+    private var runtimeOutputSessionID = UUID()
     private var isStopping = false
 
     var isRunning: Bool {
@@ -38,11 +39,16 @@ final class AgentRuntimeClient: RuntimeClienting {
 
     init(appSupportURL: URL) {
         self.appSupportURL = appSupportURL
+        self.launchLogWriter = RuntimeLaunchLogWriter(
+            logURL: appSupportURL.appendingPathComponent("logs/runtime-launch.log", isDirectory: false)
+        )
     }
 
     func start() throws {
         guard process == nil else { return }
         isStopping = false
+        runtimeOutputSessionID = UUID()
+        outputPump.reset()
 
         let scriptName = "AgentRuntimeHost.sh"
         guard let scriptURL = Bundle.main.url(forResource: "AgentRuntimeHost", withExtension: "sh") else {
@@ -78,10 +84,8 @@ final class AgentRuntimeClient: RuntimeClienting {
         self.stdinHandle = stdin.fileHandleForWriting
         self.stdoutHandle = stdout.fileHandleForReading
         self.stderrHandle = stderr.fileHandleForReading
-        self.stdoutBuffer = Data()
-        self.stderrBuffer = Data()
 
-        configureReadabilityHandlers()
+        configureReadabilityHandlers(sessionID: runtimeOutputSessionID)
         writeLaunchLog("Runtime process started")
     }
 
@@ -108,8 +112,7 @@ final class AgentRuntimeClient: RuntimeClienting {
         stdinHandle = nil
         stdoutHandle = nil
         stderrHandle = nil
-        stdoutBuffer = Data()
-        stderrBuffer = Data()
+        outputPump.reset()
         self.process = nil
     }
 
@@ -127,73 +130,55 @@ final class AgentRuntimeClient: RuntimeClienting {
         }
     }
 
-    private func configureReadabilityHandlers() {
+    private func configureReadabilityHandlers(sessionID: UUID) {
+        let outputPump = self.outputPump
+
         stdoutHandle?.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard let self else { return }
-            Task { @MainActor in
-                self.consumeOutputChunk(data, stream: .stdout)
+            guard !data.isEmpty else {
+                Task { @MainActor in
+                    guard self.runtimeOutputSessionID == sessionID else { return }
+                    self.stdoutHandle?.readabilityHandler = nil
+                }
+                return
+            }
+            outputPump.enqueue(data, stream: .stdout) { [weak self] outputs in
+                Task { @MainActor in
+                    guard let self, self.runtimeOutputSessionID == sessionID else { return }
+                    self.handleProcessedOutputs(outputs)
+                }
             }
         }
 
         stderrHandle?.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard let self else { return }
-            Task { @MainActor in
-                self.consumeOutputChunk(data, stream: .stderr)
-            }
-        }
-    }
-
-    private func consumeOutputChunk(_ data: Data, stream: StreamKind) {
-        guard !data.isEmpty else {
-            switch stream {
-            case .stdout:
-                stdoutHandle?.readabilityHandler = nil
-            case .stderr:
-                stderrHandle?.readabilityHandler = nil
-            }
-            return
-        }
-
-        switch stream {
-        case .stdout:
-            stdoutBuffer.append(data)
-            drainBuffer(&stdoutBuffer, stream: .stdout)
-        case .stderr:
-            stderrBuffer.append(data)
-            drainBuffer(&stderrBuffer, stream: .stderr)
-        }
-    }
-
-    private func drainBuffer(_ buffer: inout Data, stream: StreamKind) {
-        while let newlineIndex = buffer.firstIndex(of: 0x0A) {
-            let lineData = buffer[..<newlineIndex]
-            buffer.removeSubrange(...newlineIndex)
-            guard let line = String(data: lineData, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-                !line.isEmpty else { continue }
-
-            if Self.shouldSuppressRuntimeLog(line) {
-                continue
-            }
-
-            switch stream {
-            case .stdout:
-                writeLaunchLog("stdout: \(line)")
-                if line.hasPrefix("{") {
-                    do {
-                        let event = try JSONDecoder().decode(RuntimeEventEnvelope.self, from: Data(line.utf8))
-                        onEvent?(event)
-                    } catch {
-                        onError?("Failed to decode runtime event: \(line)")
-                    }
-                } else {
-                    onLog?("stdout: \(line)")
+            guard !data.isEmpty else {
+                Task { @MainActor in
+                    guard self.runtimeOutputSessionID == sessionID else { return }
+                    self.stderrHandle?.readabilityHandler = nil
                 }
-            case .stderr:
-                writeLaunchLog("stderr: \(line)")
-                onLog?("stderr: \(line)")
+                return
+            }
+            outputPump.enqueue(data, stream: .stderr) { [weak self] outputs in
+                Task { @MainActor in
+                    guard let self, self.runtimeOutputSessionID == sessionID else { return }
+                    self.handleProcessedOutputs(outputs)
+                }
+            }
+        }
+    }
+
+    private func handleProcessedOutputs(_ outputs: [RuntimeProcessedOutput]) {
+        for output in outputs {
+            switch output {
+            case .event(let event):
+                onEvent?(event)
+            case .log(let line):
+                onLog?(line)
+            case .error(let message):
+                onError?(message)
             }
         }
     }
@@ -226,21 +211,7 @@ final class AgentRuntimeClient: RuntimeClienting {
     }
 
     private func writeLaunchLog(_ message: String) {
-        let formatter = ISO8601DateFormatter()
-        let line = "[\(formatter.string(from: Date()))] \(message)\n"
-        let logURL = appSupportURL.appendingPathComponent("logs/runtime-launch.log", isDirectory: false)
-        try? FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: logURL.path) {
-                if let handle = try? FileHandle(forWritingTo: logURL) {
-                    _ = try? handle.seekToEnd()
-                    try? handle.write(contentsOf: data)
-                    try? handle.close()
-                }
-            } else {
-                try? data.write(to: logURL)
-            }
-        }
+        launchLogWriter.write(message)
     }
 
     private func sendShutdownCommandIfPossible() {
@@ -300,9 +271,121 @@ final class AgentRuntimeClient: RuntimeClienting {
     }
 }
 
-private enum StreamKind {
+private enum StreamKind: Sendable {
     case stdout
     case stderr
+}
+
+private enum RuntimeProcessedOutput: Sendable {
+    case event(RuntimeEventEnvelope)
+    case log(String)
+    case error(String)
+}
+
+private final class RuntimeLaunchLogWriter: @unchecked Sendable {
+    private let logURL: URL
+    private let queue = DispatchQueue(label: "MacAssistant.RuntimeLaunchLogWriter", qos: .utility)
+
+    init(logURL: URL) {
+        self.logURL = logURL
+    }
+
+    func write(_ message: String) {
+        let logURL = self.logURL
+        queue.async {
+            let formatter = ISO8601DateFormatter()
+            let line = "[\(formatter.string(from: Date()))] \(message)\n"
+            guard let data = line.data(using: .utf8) else { return }
+            try? FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: logURL.path) {
+                if let handle = try? FileHandle(forWritingTo: logURL) {
+                    _ = try? handle.seekToEnd()
+                    try? handle.write(contentsOf: data)
+                    try? handle.close()
+                }
+            } else {
+                try? data.write(to: logURL)
+            }
+        }
+    }
+}
+
+private final class RuntimeOutputPump: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "MacAssistant.RuntimeOutputPump", qos: .userInitiated)
+    private let logWriter: RuntimeLaunchLogWriter
+    private var stdoutBuffer = Data()
+    private var stderrBuffer = Data()
+
+    init(logWriter: RuntimeLaunchLogWriter) {
+        self.logWriter = logWriter
+    }
+
+    func enqueue(
+        _ data: Data,
+        stream: StreamKind,
+        deliver: @escaping @Sendable ([RuntimeProcessedOutput]) -> Void
+    ) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let outputs = self.consume(data, stream: stream)
+            guard !outputs.isEmpty else { return }
+            deliver(outputs)
+        }
+    }
+
+    func reset() {
+        queue.async { [weak self] in
+            self?.stdoutBuffer.removeAll(keepingCapacity: false)
+            self?.stderrBuffer.removeAll(keepingCapacity: false)
+        }
+    }
+
+    private func consume(_ data: Data, stream: StreamKind) -> [RuntimeProcessedOutput] {
+        switch stream {
+        case .stdout:
+            stdoutBuffer.append(data)
+            return drain(buffer: &stdoutBuffer, stream: .stdout)
+        case .stderr:
+            stderrBuffer.append(data)
+            return drain(buffer: &stderrBuffer, stream: .stderr)
+        }
+    }
+
+    private func drain(buffer: inout Data, stream: StreamKind) -> [RuntimeProcessedOutput] {
+        var outputs: [RuntimeProcessedOutput] = []
+
+        while let newlineIndex = buffer.firstIndex(of: 0x0A) {
+            let lineData = buffer[..<newlineIndex]
+            buffer.removeSubrange(...newlineIndex)
+            guard let line = String(data: lineData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                !line.isEmpty else { continue }
+
+            if AgentRuntimeClient.shouldSuppressRuntimeLog(line) {
+                continue
+            }
+
+            switch stream {
+            case .stdout:
+                logWriter.write("stdout: \(line)")
+                if line.hasPrefix("{") {
+                    do {
+                        let event = try JSONDecoder().decode(RuntimeEventEnvelope.self, from: Data(line.utf8))
+                        outputs.append(.event(event))
+                    } catch {
+                        outputs.append(.error("Failed to decode runtime event: \(line)"))
+                    }
+                } else {
+                    outputs.append(.log("stdout: \(line)"))
+                }
+            case .stderr:
+                logWriter.write("stderr: \(line)")
+                outputs.append(.log("stderr: \(line)"))
+            }
+        }
+
+        return outputs
+    }
 }
 
 enum RuntimeLaunchError: LocalizedError, Equatable {

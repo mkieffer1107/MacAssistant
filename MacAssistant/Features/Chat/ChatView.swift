@@ -12,6 +12,7 @@ struct ChatView: View {
     @FocusState private var isComposerFocused: Bool
     @State private var editingUserMessageID: UUID?
     @State private var editingUserMessageText = ""
+    @State private var pendingScrollTask: Task<Void, Never>?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -92,17 +93,27 @@ struct ChatView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(.vertical, 12)
             .onAppear {
-                scrollToBottom(proxy)
+                scheduleScrollToBottom(proxy, delay: .zero)
             }
-            .onChange(of: model.conversation) { _, _ in
-                scrollToBottom(proxy)
+            .onChange(of: model.transcriptRevision) { _, _ in
+                scheduleScrollToBottom(proxy, delay: .milliseconds(75))
+            }
+            .onDisappear {
+                pendingScrollTask?.cancel()
+                pendingScrollTask = nil
             }
         }
     }
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        DispatchQueue.main.async {
+    private func scheduleScrollToBottom(_ proxy: ScrollViewProxy, delay: Duration) {
+        pendingScrollTask?.cancel()
+        pendingScrollTask = Task {
+            if delay > .zero {
+                try? await Task.sleep(for: delay)
+            }
+            guard !Task.isCancelled else { return }
             proxy.scrollTo(transcriptBottomAnchor, anchor: .bottom)
+            pendingScrollTask = nil
         }
     }
 

@@ -3,9 +3,14 @@ name: Release macOS App
 on:
   push:
     branches:
-      - "**"
+      - main
     tags:
-      - "*"
+      - "v*.*.*"
+      - "*.*.*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -14,9 +19,13 @@ jobs:
   build-and-release:
     name: Build and publish release
     runs-on: macos-26
+    env:
+      DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+      DEVELOPER_ID_APPLICATION: ${{ secrets.DEVELOPER_ID_APPLICATION }}
+      NOTARY_PROFILE: ${{ secrets.NOTARY_PROFILE }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -100,16 +109,22 @@ jobs:
             RELEASE_NAME="Release ${GITHUB_REF_NAME}"
             PRERELEASE="false"
             MAKE_LATEST="true"
+            BUILD_MODE="signed"
           else
             VERSION="${GITHUB_SHA::7}"
-            RELEASE_TAG="nightly-${GITHUB_RUN_NUMBER}-${VERSION}"
-            RELEASE_NAME="Nightly ${VERSION} (${GITHUB_RUN_NUMBER})"
+            RELEASE_TAG="nightly"
+            RELEASE_NAME="Nightly"
             PRERELEASE="true"
             MAKE_LATEST="false"
+            BUILD_MODE="nightly"
           fi
 
           chmod +x ./build.sh
-          ./build.sh "$VERSION" --local
+          if [ "$BUILD_MODE" = "signed" ]; then
+            ./build.sh "$VERSION"
+          else
+            ./build.sh "$VERSION" --local
+          fi
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
@@ -118,7 +133,36 @@ jobs:
           echo "make_latest=$MAKE_LATEST" >> "$GITHUB_OUTPUT"
           echo "release_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Upload release assets
+      - name: Stage nightly release assets
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ steps.build.outputs.version }}"
+          NIGHTLY_DIR="dist/nightly"
+          rm -rf "$NIGHTLY_DIR"
+          mkdir -p "$NIGHTLY_DIR"
+
+          cp "dist/${VERSION}/MacAssistant-${VERSION}.dmg" "$NIGHTLY_DIR/MacAssistant-nightly.dmg"
+          cp "dist/${VERSION}/MacAssistant-${VERSION}.zip" "$NIGHTLY_DIR/MacAssistant-nightly.zip"
+
+          (
+            cd "$NIGHTLY_DIR"
+            shasum -a 256 MacAssistant-nightly.zip MacAssistant-nightly.dmg > SHA256SUMS-nightly.txt
+          )
+
+      - name: Move nightly tag
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f nightly "$GITHUB_SHA"
+          git push origin refs/tags/nightly --force
+
+      - name: Upload nightly release assets
+        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.build.outputs.release_tag }}
@@ -126,6 +170,22 @@ jobs:
           prerelease: ${{ steps.build.outputs.prerelease }}
           make_latest: ${{ steps.build.outputs.make_latest }}
           target_commitish: ${{ steps.build.outputs.release_sha }}
+          overwrite_files: true
+          files: |
+            dist/nightly/MacAssistant-nightly.dmg
+            dist/nightly/MacAssistant-nightly.zip
+            dist/nightly/SHA256SUMS-nightly.txt
+
+      - name: Upload tagged release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.build.outputs.release_tag }}
+          name: ${{ steps.build.outputs.release_name }}
+          prerelease: ${{ steps.build.outputs.prerelease }}
+          make_latest: ${{ steps.build.outputs.make_latest }}
+          target_commitish: ${{ steps.build.outputs.release_sha }}
+          overwrite_files: true
           files: |
             dist/${{ steps.build.outputs.version }}/MacAssistant-${{ steps.build.outputs.version }}.dmg
             dist/${{ steps.build.outputs.version }}/MacAssistant-${{ steps.build.outputs.version }}.zip

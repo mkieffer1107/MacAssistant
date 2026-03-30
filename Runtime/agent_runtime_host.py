@@ -211,6 +211,12 @@ class ToolCallRequest:
 
 
 @dataclass
+class ToolExecutionResult:
+    output: str
+    failed: bool
+
+
+@dataclass
 class AssistantStepResult:
     text: str
     tool_calls: list[ToolCallRequest]
@@ -1920,7 +1926,7 @@ class RuntimeHost:
         pending: PendingToolApproval,
         *,
         approved: bool,
-    ) -> str:
+    ) -> ToolExecutionResult:
         tool_call = pending.tool_call
         if not approved:
             tool_result = "Tool execution was denied by the user."
@@ -1933,7 +1939,7 @@ class RuntimeHost:
                     "output": tool_result,
                 }
             )
-            return tool_result
+            return ToolExecutionResult(output=tool_result, failed=True)
 
         self.emit(
             {
@@ -1963,7 +1969,7 @@ class RuntimeHost:
                     "output": tool_result,
                 }
             )
-            return tool_result
+            return ToolExecutionResult(output=tool_result, failed=False)
         except Exception as exc:  # noqa: BLE001
             if self.is_turn_cancelled(turn_id):
                 raise
@@ -1977,18 +1983,35 @@ class RuntimeHost:
                     "output": tool_result,
                 }
             )
-            return tool_result
+            return ToolExecutionResult(output=tool_result, failed=True)
 
-    def tool_response_message(self, tool_result: str) -> dict[str, Any]:
+    def tool_response_message(self, tool_result: ToolExecutionResult) -> dict[str, Any]:
+        response_body = tool_result.output.strip()
+        if tool_result.failed:
+            response_body = "\n".join(
+                [
+                    response_body,
+                    "",
+                    "The task is still unresolved.",
+                    "Inspect the error above and, if it looks fixable, continue with a corrected tool call instead of stopping.",
+                    "Prefer corrected local app automation over shell shortcuts, capability disclaimers, or giving up early.",
+                    "Only stop without another tool call if the task is genuinely impossible, blocked by permissions or approval, or requires explicit user input.",
+                ]
+            ).strip()
         return {
             "role": "user",
-            "content": f"<tool_response>\n{tool_result.strip()}\n</tool_response>",
+            "content": f"<tool_response>\n{response_body}\n</tool_response>",
         }
 
     def agent_loop_system_prompt(self) -> str:
         return (
             "You are a local macOS assistant. "
-            "Use the available tools whenever live machine state, app state, files, or automation are required. "
+            "Keep working until the user's task is actually complete. "
+            "Use the available tools whenever live machine state, app state, files, browser state, or automation are required. "
+            "If a tool attempt fails and the error looks fixable, inspect the failure, correct the approach, and continue with another tool call. "
+            "Do not turn a fixable automation failure into a generic limitation answer. "
+            "Prefer corrected local app automation over shell shortcuts, hand-wavy instructions, or capability disclaimers. "
+            "Only stop without another tool call when the task is complete, clearly impossible with the available tools, blocked by permissions or approval, or requires explicit user input. "
             "If tools are unnecessary, answer directly in concise Markdown. "
             "Do not mention internal tool syntax or hidden reasoning."
         )

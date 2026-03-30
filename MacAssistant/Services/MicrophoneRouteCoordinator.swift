@@ -241,7 +241,10 @@ final class MicrophoneRouteCoordinator: NSObject, MicrophoneRouteCoordinating, @
 
         var value: CFString = "" as CFString
         var size = UInt32(MemoryLayout<CFString>.size)
-        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr else {
+        let status = withUnsafeMutablePointer(to: &value) { pointer in
+            AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, pointer)
+        }
+        guard status == noErr else {
             return nil
         }
         return value as String
@@ -257,7 +260,10 @@ final class MicrophoneRouteCoordinator: NSObject, MicrophoneRouteCoordinating, @
 
         var value: CFString = "" as CFString
         var size = UInt32(MemoryLayout<CFString>.size)
-        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr else {
+        let status = withUnsafeMutablePointer(to: &value) { pointer in
+            AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, pointer)
+        }
+        guard status == noErr else {
             return nil
         }
         return value as String
@@ -302,5 +308,21 @@ final class MicrophoneRouteCoordinator: NSObject, MicrophoneRouteCoordinating, @
         }
         guard status == noErr else { return nil }
         return value
+    }
+}
+
+final class NoopMicrophoneRouteCoordinator: MicrophoneRouteCoordinating, @unchecked Sendable {
+    static let shared = NoopMicrophoneRouteCoordinator()
+
+    func prepareForRecording(inputDevice: MicrophoneCaptureService.InputDevice?) async throws -> MicrophoneRouteCoordinator.PreflightResult {
+        .init(defaultOutputDevice: nil, didEngageArbitration: false)
+    }
+
+    func cancelPendingPreparation() {}
+
+    func leaveRecordingRoute() {}
+
+    func routeStateSnapshot() -> MicrophoneRouteCoordinator.RouteState {
+        .init(defaultOutputDevice: nil, isArbitrationActive: false)
     }
 }

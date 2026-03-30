@@ -8,6 +8,7 @@ Icon?
 
 build/
 DerivedData/
+.derivedData/
 .build/
 .swiftpm/
 xcuserdata/

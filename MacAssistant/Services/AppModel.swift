@@ -46,6 +46,11 @@ final class AppModel {
         var bufferedChunks: [MicrophoneCaptureService.CaptureChunk] = []
     }
 
+    private struct PendingAssistantDelta {
+        var text: String = ""
+        var isFinalSegment: Bool?
+    }
+
     struct SettingsState: Codable, Sendable, Equatable {
         private enum CodingKeys: String, CodingKey {
             case defaultVoicePreset
@@ -129,10 +134,11 @@ final class AppModel {
     private let appSupportURL: URL
     private let shouldPersistSettings: Bool
     @ObservationIgnored private let runtime: any RuntimeClienting
-    @ObservationIgnored private let microphoneService: any MicrophoneCaptureServicing
+    @ObservationIgnored private let microphoneService: any MicrophoneCaptureServicing & Sendable
     @ObservationIgnored private let microphoneRouteCoordinator: any MicrophoneRouteCoordinating
     @ObservationIgnored private let playbackService: any AudioPlaybackServicing
     private let microphoneStartRetryDelay: Duration
+    private let assistantDeltaFlushDelay: Duration
     private static let retryableMicrophoneStartErrorCode = -10868
     private static let byteFormatter: ByteCountFormatter = {
         let formatter = ByteCountFormatter()
@@ -156,6 +162,7 @@ final class AppModel {
         }
     )
     var conversation: [ConversationItem] = []
+    var transcriptRevision = 0
     var composerText = ""
     var pendingComposerImage: ComposerImageAttachment?
     var availableInputDevices: [MicrophoneCaptureService.InputDevice] = []
@@ -269,9 +276,10 @@ final class AppModel {
     private var activeReplySpeechTurnID: String?
     private var replySpeechPhase: ReplySpeechPhase = .idle
     private var speechOnlyTurnIDs = Set<String>()
-    private var assistantMessageIDsBySegment: [String: UUID] = [:]
-    private var voiceDraftIDsByTurn: [String: UUID] = [:]
-    private var toolMessageIDsByCall: [String: UUID] = [:]
+    private var assistantMessageIDsBySegment: [String: Int] = [:]
+    private var voiceDraftIDsByTurn: [String: Int] = [:]
+    private var toolMessageIDsByCall: [String: Int] = [:]
+    private var pendingAssistantDeltasBySegment: [String: PendingAssistantDelta] = [:]
     private var discardedTurnIDs = Set<String>()
     private var hasRequestedWarmup = false
     private var hasStartedBackgroundSTTWarm = false
@@ -285,6 +293,7 @@ final class AppModel {
     @ObservationIgnored private var microphoneStartRetryTask: Task<Void, Never>?
     @ObservationIgnored private var microphoneRoutePreflightTask: Task<Void, Never>?
     @ObservationIgnored private var microphoneAccessTask: Task<Void, Never>?
+    @ObservationIgnored private var assistantDeltaFlushTask: Task<Void, Never>?
 
     private var attachmentsDirectoryURL: URL {
         appSupportURL.appendingPathComponent("attachments", isDirectory: true)
@@ -294,11 +303,12 @@ final class AppModel {
         appSupportURL: URL? = nil,
         persistSettings: Bool? = nil,
         runtime: (any RuntimeClienting)? = nil,
-        microphoneService: (any MicrophoneCaptureServicing)? = nil,
+        microphoneService: (any MicrophoneCaptureServicing & Sendable)? = nil,
         microphoneRouteCoordinator: (any MicrophoneRouteCoordinating)? = nil,
         playbackService: (any AudioPlaybackServicing)? = nil,
         voiceCaptureWaitingDelay: Duration = .seconds(2),
-        microphoneStartRetryDelay: Duration = .milliseconds(250)
+        microphoneStartRetryDelay: Duration = .milliseconds(250),
+        assistantDeltaFlushDelay: Duration = .milliseconds(50)
     ) {
         let supportURL = appSupportURL ?? Self.defaultAppSupportURL()
         let shouldPersistSettings = persistSettings ?? !Self.isRunningTests
@@ -306,10 +316,11 @@ final class AppModel {
         self.shouldPersistSettings = shouldPersistSettings
         self.runtime = runtime ?? AgentRuntimeClient(appSupportURL: supportURL)
         self.microphoneService = microphoneService ?? MicrophoneCaptureService()
-        self.microphoneRouteCoordinator = microphoneRouteCoordinator ?? MicrophoneRouteCoordinator.shared
+        self.microphoneRouteCoordinator = microphoneRouteCoordinator ?? (Self.isRunningTests ? NoopMicrophoneRouteCoordinator.shared : MicrophoneRouteCoordinator.shared)
         self.playbackService = playbackService ?? AudioPlaybackService()
         self.voiceCaptureWaitingDelay = voiceCaptureWaitingDelay
         self.microphoneStartRetryDelay = microphoneStartRetryDelay
+        self.assistantDeltaFlushDelay = assistantDeltaFlushDelay
         self.settings = shouldPersistSettings ? Self.loadSettings(from: supportURL) : SettingsState()
         self.availableInputDevices = self.microphoneService.availableInputDevices()
         self.runtime.onEvent = { [weak self] event in
@@ -640,6 +651,7 @@ final class AppModel {
             source: .typed,
             isCancelled: false
         )))
+        noteConversationChanged()
         composerText = ""
         pendingComposerImage = nil
         statusText = "Thinking…"
@@ -691,21 +703,19 @@ final class AppModel {
             beginVoiceRecording()
         case .notDetermined:
             statusText = "Requesting microphone access…"
-            let microphoneService = self.microphoneService
-            microphoneAccessTask = Task { [weak self] in
-                let granted = await microphoneService.requestAccess()
-                await MainActor.run {
-                    guard let self else { return }
-                    self.microphoneAccessTask = nil
-                    guard !Task.isCancelled else { return }
-                    guard self.voiceRecordingState == nil, !self.isAwaitingAgentResponse else { return }
-                    if granted {
-                        self.beginVoiceRecording()
-                    } else {
-                        let message = MicrophoneCaptureService.CaptureError.permissionDenied.localizedDescription
-                        self.appendSystemStatus(message, level: "error")
-                        self.statusText = message
-                    }
+            microphoneAccessTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+
+                let granted = await self.microphoneService.requestAccess()
+                self.microphoneAccessTask = nil
+                guard !Task.isCancelled else { return }
+                guard self.voiceRecordingState == nil, !self.isAwaitingAgentResponse else { return }
+                if granted {
+                    self.beginVoiceRecording()
+                } else {
+                    let message = MicrophoneCaptureService.CaptureError.permissionDenied.localizedDescription
+                    self.appendSystemStatus(message, level: "error")
+                    self.statusText = message
                 }
             }
         case .denied:
@@ -842,7 +852,9 @@ final class AppModel {
         isStopping = false
         composerText = ""
         pendingComposerImage = nil
+        clearPendingAssistantDeltaState()
         conversation.removeAll()
+        noteConversationChanged()
         activeTurnIDs.removeAll()
         activeResponseTurnID = nil
         resetReplySpeechState()
@@ -925,7 +937,6 @@ final class AppModel {
             imageAttachment: imageAttachment,
             phase: .capturing
         )
-        voiceDraftIDsByTurn[turnID] = draftID
         conversation.append(.userVoiceDraft(UserVoiceDraft(
             id: draftID,
             turnID: turnID,
@@ -934,6 +945,8 @@ final class AppModel {
             source: .voice,
             isCancelled: false
         )))
+        voiceDraftIDsByTurn[turnID] = conversation.count - 1
+        noteConversationChanged()
         pendingComposerImage = nil
         statusText = "Listening…"
         startMicrophoneCapture(for: turnID, isRetry: false)
@@ -1540,6 +1553,10 @@ final class AppModel {
     }
 
     func handle(event: RuntimeEventEnvelope) {
+        if event.type != "assistant_delta" {
+            flushPendingAssistantDeltas()
+        }
+
         switch event.type {
         case "bootstrap_progress":
             hasReceivedBootstrapProgress = true
@@ -1567,7 +1584,7 @@ final class AppModel {
             }
         case "assistant_delta":
             guard let turnID = event.turnID, !discardedTurnIDs.contains(turnID) else { return }
-            appendAssistantDelta(
+            enqueueAssistantDelta(
                 turnID: turnID,
                 segmentID: event.assistantSegmentID ?? turnID,
                 delta: event.text ?? "",
@@ -1703,8 +1720,9 @@ final class AppModel {
             output: "",
             isExpanded: approvalState == .pending && !settings.alwaysAcceptToolCalls
         )
-        toolMessageIDsByCall[toolCallID] = tool.id
         conversation.append(.toolInvocation(tool))
+        toolMessageIDsByCall[toolCallID] = conversation.count - 1
+        noteConversationChanged()
         if settings.alwaysAcceptToolCalls, tool.approvalState == .pending {
             approveTool(turnID: turnID, toolCallID: toolCallID, suppressRuntimeUnavailableError: true)
         }
@@ -1793,10 +1811,15 @@ final class AppModel {
     }
 
     private func finishAssistantMessages(_ turnID: String) {
+        var didChangeConversation = false
         for index in conversation.indices {
             guard case .assistantMessage(var message) = conversation[index], message.turnID == turnID else { continue }
             message.isStreaming = false
             conversation[index] = .assistantMessage(message)
+            didChangeConversation = true
+        }
+        if didChangeConversation {
+            noteConversationChanged()
         }
     }
 
@@ -1811,9 +1834,10 @@ final class AppModel {
         microphoneAccessTask = nil
         cancelMicrophoneRoutePreflight()
         cancelVoiceCaptureWaitingTask()
+        clearPendingAssistantDeltaState()
         microphoneRouteCoordinator.leaveRecordingRoute()
         voiceRecordingState = nil
-        for turnID in voiceDraftIDsByTurn.keys {
+        for turnID in Array(voiceDraftIDsByTurn.keys) {
             removeVoiceDraft(turnID: turnID)
         }
         assistantMessageIDsBySegment.removeAll()
@@ -2201,29 +2225,123 @@ final class AppModel {
             || provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
     }
 
+    private func noteConversationChanged() {
+        transcriptRevision &+= 1
+    }
+
+    private func scheduleAssistantDeltaFlushIfNeeded() {
+        guard assistantDeltaFlushTask == nil else { return }
+        let delay = assistantDeltaFlushDelay
+        assistantDeltaFlushTask = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            self?.flushPendingAssistantDeltas()
+        }
+    }
+
+    private func clearPendingAssistantDeltaState() {
+        assistantDeltaFlushTask?.cancel()
+        assistantDeltaFlushTask = nil
+        pendingAssistantDeltasBySegment.removeAll()
+    }
+
+    private func enqueueAssistantDelta(
+        turnID: String,
+        segmentID: String,
+        delta: String,
+        isFinalSegment: Bool?
+    ) {
+        if assistantMessageIDsBySegment[segmentID] == nil {
+            let message = AssistantMessage(
+                id: UUID(),
+                turnID: turnID,
+                segmentID: segmentID,
+                text: delta,
+                isStreaming: isFinalSegment != true,
+                isCancelled: false,
+                isFinalSegment: isFinalSegment ?? false,
+                source: voiceDraftIDsByTurn[turnID] == nil ? .typed : .voice
+            )
+            let index = conversation.count
+            conversation.append(.assistantMessage(message))
+            assistantMessageIDsBySegment[segmentID] = index
+            noteConversationChanged()
+            return
+        }
+
+        var pendingDelta = pendingAssistantDeltasBySegment[segmentID] ?? PendingAssistantDelta()
+        pendingDelta.text += delta
+        if let isFinalSegment {
+            pendingDelta.isFinalSegment = isFinalSegment
+        }
+        pendingAssistantDeltasBySegment[segmentID] = pendingDelta
+
+        if pendingDelta.isFinalSegment == true {
+            flushPendingAssistantDelta(segmentID)
+        } else {
+            scheduleAssistantDeltaFlushIfNeeded()
+        }
+    }
+
+    private func flushPendingAssistantDeltas() {
+        assistantDeltaFlushTask?.cancel()
+        assistantDeltaFlushTask = nil
+
+        let orderedSegmentIDs = pendingAssistantDeltasBySegment.keys.sorted {
+            (assistantMessageIDsBySegment[$0] ?? Int.max) < (assistantMessageIDsBySegment[$1] ?? Int.max)
+        }
+        for segmentID in orderedSegmentIDs {
+            flushPendingAssistantDelta(segmentID)
+        }
+    }
+
+    private func flushPendingAssistantDelta(_ segmentID: String) {
+        guard let pendingDelta = pendingAssistantDeltasBySegment.removeValue(forKey: segmentID),
+              let index = assistantMessageIDsBySegment[segmentID],
+              case .assistantMessage(var message) = conversation[index] else { return }
+
+        if !pendingDelta.text.isEmpty {
+            message.text += pendingDelta.text
+        }
+        if let isFinalSegment = pendingDelta.isFinalSegment {
+            message.isFinalSegment = isFinalSegment
+            message.isStreaming = !isFinalSegment
+        } else {
+            message.isStreaming = true
+        }
+        conversation[index] = .assistantMessage(message)
+        noteConversationChanged()
+
+        if pendingAssistantDeltasBySegment.isEmpty {
+            assistantDeltaFlushTask?.cancel()
+            assistantDeltaFlushTask = nil
+        }
+    }
+
     private func updateVoiceDraft(turnID: String, text: String) {
-        guard let draftID = voiceDraftIDsByTurn[turnID],
-              let index = conversation.firstIndex(where: { $0.id == draftID }) else { return }
+        guard let index = voiceDraftIDsByTurn[turnID] else { return }
         if case .userVoiceDraft(var draft) = conversation[index] {
             draft.text = text
             conversation[index] = .userVoiceDraft(draft)
+            noteConversationChanged()
         }
     }
 
     @discardableResult
     private func commitVoiceDraft(turnID: String, text: String) -> Bool {
-        guard let draftID = voiceDraftIDsByTurn[turnID],
-              let index = conversation.firstIndex(where: { $0.id == draftID }),
+        guard let index = voiceDraftIDsByTurn[turnID],
               case .userVoiceDraft(let draft) = conversation[index] else { return false }
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmedText.isEmpty, draft.imageAttachment == nil {
             conversation.remove(at: index)
             voiceDraftIDsByTurn.removeValue(forKey: turnID)
+            rebuildConversationIndices()
+            noteConversationChanged()
             return false
         }
         let resolvedText = resolvedComposerText(from: trimmedText, imageAttachment: draft.imageAttachment)
         conversation[index] = .userMessage(UserMessage(
-            id: draftID,
+            id: draft.id,
             turnID: turnID,
             text: resolvedText,
             imageAttachment: draft.imageAttachment,
@@ -2231,48 +2349,18 @@ final class AppModel {
             isCancelled: false
         ))
         voiceDraftIDsByTurn.removeValue(forKey: turnID)
+        noteConversationChanged()
         return true
     }
 
     private func removeVoiceDraft(turnID: String, clearActiveResponseTurn: Bool = true) {
-        guard let draftID = voiceDraftIDsByTurn.removeValue(forKey: turnID) else { return }
-        conversation.removeAll { $0.id == draftID }
+        guard let index = voiceDraftIDsByTurn.removeValue(forKey: turnID) else { return }
+        conversation.remove(at: index)
+        rebuildConversationIndices()
+        noteConversationChanged()
         activeTurnIDs.remove(turnID)
         if clearActiveResponseTurn, activeResponseTurnID == turnID {
             activeResponseTurnID = nil
-        }
-    }
-
-    private func appendAssistantDelta(
-        turnID: String,
-        segmentID: String,
-        delta: String,
-        isFinalSegment: Bool?
-    ) {
-        if let messageID = assistantMessageIDsBySegment[segmentID],
-           let index = conversation.firstIndex(where: { $0.id == messageID }),
-           case .assistantMessage(var message) = conversation[index] {
-            message.text += delta
-            if let isFinalSegment {
-                message.isFinalSegment = isFinalSegment
-                message.isStreaming = false
-            } else {
-                message.isStreaming = true
-            }
-            conversation[index] = .assistantMessage(message)
-        } else {
-            let message = AssistantMessage(
-                id: UUID(),
-                turnID: turnID,
-                segmentID: segmentID,
-                text: delta,
-                isStreaming: isFinalSegment == nil,
-                isCancelled: false,
-                isFinalSegment: isFinalSegment ?? false,
-                source: voiceDraftIDsByTurn[turnID] == nil ? .typed : .voice
-            )
-            assistantMessageIDsBySegment[segmentID] = message.id
-            conversation.append(.assistantMessage(message))
         }
     }
 
@@ -2315,7 +2403,9 @@ final class AppModel {
         activeResponseTurnID = turnID
         isStopping = false
         statusText = "Thinking…"
+        clearPendingAssistantDeltaState()
         rebuildConversationIndices()
+        noteConversationChanged()
 
         do {
             try runtime.send(RuntimeCommandEnvelope(
@@ -2338,14 +2428,14 @@ final class AppModel {
         voiceDraftIDsByTurn.removeAll()
         toolMessageIDsByCall.removeAll()
 
-        for item in conversation {
+        for (index, item) in conversation.enumerated() {
             switch item {
             case .userVoiceDraft(let draft):
-                voiceDraftIDsByTurn[draft.turnID] = draft.id
+                voiceDraftIDsByTurn[draft.turnID] = index
             case .assistantMessage(let message):
-                assistantMessageIDsBySegment[message.segmentID] = message.id
+                assistantMessageIDsBySegment[message.segmentID] = index
             case .toolInvocation(let tool):
-                toolMessageIDsByCall[tool.toolCallID] = tool.id
+                toolMessageIDsByCall[tool.toolCallID] = index
             default:
                 break
             }
@@ -2353,32 +2443,40 @@ final class AppModel {
     }
 
     private func updateTool(_ toolCallID: String, mutate: (inout ToolInvocation) -> Void) {
-        guard let messageID = toolMessageIDsByCall[toolCallID],
-              let index = conversation.firstIndex(where: { $0.id == messageID }),
+        guard let index = toolMessageIDsByCall[toolCallID],
               case .toolInvocation(var tool) = conversation[index] else { return }
         mutate(&tool)
         conversation[index] = .toolInvocation(tool)
+        noteConversationChanged()
     }
 
     private func markTurnCancelled(_ turnID: String) {
+        var didChangeConversation = false
         for index in conversation.indices {
             switch conversation[index] {
             case .userVoiceDraft(var draft) where draft.turnID == turnID:
                 draft.isCancelled = true
                 conversation[index] = .userVoiceDraft(draft)
+                didChangeConversation = true
             case .userMessage(var message) where message.turnID == turnID:
                 message.isCancelled = true
                 conversation[index] = .userMessage(message)
+                didChangeConversation = true
             case .assistantMessage(var message) where message.turnID == turnID:
                 message.isCancelled = true
                 message.isStreaming = false
                 conversation[index] = .assistantMessage(message)
+                didChangeConversation = true
             case .toolInvocation(var tool) where tool.turnID == turnID:
                 tool.executionState = .cancelled
                 conversation[index] = .toolInvocation(tool)
+                didChangeConversation = true
             default:
                 break
             }
+        }
+        if didChangeConversation {
+            noteConversationChanged()
         }
     }
 
@@ -2389,6 +2487,7 @@ final class AppModel {
             return
         }
         conversation.append(.systemStatus(SystemStatusMessage(id: UUID(), turnID: nil, text: text, level: level)))
+        noteConversationChanged()
     }
 
     private func sendTextTurn(

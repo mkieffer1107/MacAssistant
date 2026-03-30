@@ -1,3 +1,4 @@
+import AudioToolbox
 import AVFoundation
 import AppKit
 import Foundation
@@ -237,6 +238,106 @@ struct MacAssistantTests {
 
     @Test
     @MainActor
+    func assistantDeltaFlushesBufferedSegmentTextBeforeToolCards() {
+        let model = AppModel(assistantDeltaFlushDelay: .seconds(60))
+
+        model.handle(event: runtimeEvent(
+            type: "assistant_delta",
+            turnID: "turn-1",
+            text: "Searching",
+            assistantSegmentID: "segment-1",
+            isFinalSegment: false
+        ))
+        model.handle(event: runtimeEvent(
+            type: "assistant_delta",
+            turnID: "turn-1",
+            text: " Safari",
+            assistantSegmentID: "segment-1",
+            isFinalSegment: false
+        ))
+
+        let assistantBeforeFlush = model.conversation.compactMap { item -> AssistantMessage? in
+            guard case .assistantMessage(let message) = item else { return nil }
+            return message
+        }
+        #expect(assistantBeforeFlush.count == 1)
+        #expect(assistantBeforeFlush.first?.text == "Searching")
+
+        model.handle(event: runtimeEvent(
+            type: "tool_proposed",
+            turnID: "turn-1",
+            toolCallID: "tool-1",
+            toolName: "execute_script",
+            toolSummary: "Drive Safari",
+            toolArguments: ["script_content": .string("tell application \"Safari\" to activate")],
+            safetyClass: SafetyClass.readOnly.rawValue,
+            approvalState: ApprovalState.notRequired.rawValue,
+            executionState: ExecutionState.proposed.rawValue
+        ))
+
+        let itemKinds = model.conversation.map { item -> String in
+            switch item {
+            case .assistantMessage:
+                return "assistant"
+            case .toolInvocation:
+                return "tool"
+            default:
+                return "other"
+            }
+        }
+        let assistantAfterFlush = model.conversation.compactMap { item -> AssistantMessage? in
+            guard case .assistantMessage(let message) = item else { return nil }
+            return message
+        }
+
+        #expect(itemKinds == ["assistant", "tool"])
+        #expect(assistantAfterFlush.first?.text == "Searching Safari")
+        #expect(assistantAfterFlush.first?.isStreaming == true)
+    }
+
+    @Test
+    @MainActor
+    func repeatedToolUpdatesMutateExistingToolCardInsteadOfAppendingMoreCards() throws {
+        let model = AppModel()
+
+        model.handle(event: runtimeEvent(
+            type: "tool_proposed",
+            turnID: "turn-1",
+            toolCallID: "tool-1",
+            toolName: "execute_script",
+            toolSummary: "Inspect Safari",
+            toolArguments: ["script_content": .string("return 1")],
+            safetyClass: SafetyClass.readOnly.rawValue,
+            approvalState: ApprovalState.notRequired.rawValue,
+            executionState: ExecutionState.proposed.rawValue
+        ))
+        model.handle(event: runtimeEvent(
+            type: "tool_output",
+            turnID: "turn-1",
+            toolCallID: "tool-1",
+            output: "partial output"
+        ))
+        model.handle(event: runtimeEvent(
+            type: "tool_finished",
+            turnID: "turn-1",
+            toolCallID: "tool-1",
+            executionState: ExecutionState.finished.rawValue,
+            output: "final output"
+        ))
+
+        let toolMessages = model.conversation.compactMap { item -> ToolInvocation? in
+            guard case .toolInvocation(let tool) = item else { return nil }
+            return tool
+        }
+        let tool = try #require(toolMessages.first)
+
+        #expect(toolMessages.count == 1)
+        #expect(tool.output == "final output")
+        #expect(tool.executionState == .finished)
+    }
+
+    @Test
+    @MainActor
     func rerunHistoryIncludesOnlyFinalAssistantSegment() throws {
         let runtime = FakeRuntimeClient()
         let model = AppModel(runtime: runtime)
@@ -434,8 +535,11 @@ struct MacAssistantTests {
         )
         let controllerFactory = FakeCaptureControllerFactory()
         let controller = FakeCaptureController(
-            resolvedInputDeviceUID: airPodsMicrophone.uid,
-            resolvedInputDeviceName: airPodsMicrophone.name
+            boundInputDeviceID: airPodsMicrophone.deviceID,
+            boundInputDeviceUID: airPodsMicrophone.uid,
+            boundInputDeviceName: airPodsMicrophone.name,
+            deviceInputFormat: AVAudioFormat(standardFormatWithSampleRate: 24_000, channels: 1),
+            clientInputFormat: AVAudioFormat(standardFormatWithSampleRate: 24_000, channels: 1)
         )
         controllerFactory.queuedControllers = [controller]
         let logs = LockedLogMessages()
@@ -458,9 +562,10 @@ struct MacAssistantTests {
             chunkHandler: { _ in }
         )
 
-        #expect(controllerFactory.requestedInputDeviceUIDs == [airPodsMicrophone.uid])
+        #expect(controllerFactory.selectedInputDeviceUIDs == [airPodsMicrophone.uid])
         #expect(started.value == 1)
         #expect(logs.contains("Capture session started device=My AirPods Pro [airpods-mic]"))
+        #expect(logs.contains("selected=My AirPods Pro [airpods-mic]"))
         service.stop()
         #expect(controller.stopCallCount == 1)
     }
@@ -475,8 +580,11 @@ struct MacAssistantTests {
         )
         let controllerFactory = FakeCaptureControllerFactory()
         let controller = FakeCaptureController(
-            resolvedInputDeviceUID: builtInMicrophone.uid,
-            resolvedInputDeviceName: builtInMicrophone.name
+            boundInputDeviceID: builtInMicrophone.deviceID,
+            boundInputDeviceUID: builtInMicrophone.uid,
+            boundInputDeviceName: builtInMicrophone.name,
+            deviceInputFormat: AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1),
+            clientInputFormat: AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)
         )
         controllerFactory.queuedControllers = [controller]
         let logs = LockedLogMessages()
@@ -498,9 +606,10 @@ struct MacAssistantTests {
             chunkHandler: { _ in }
         )
 
-        #expect(controllerFactory.requestedInputDeviceUIDs == [nil])
+        #expect(controllerFactory.selectedInputDeviceUIDs == [builtInMicrophone.uid])
         #expect(logs.contains("Requested input device uid=missing-mic is unavailable. Falling back to the active system route."))
         #expect(logs.contains("Capture session started device=MacBook Pro Microphone [built-in-mic]"))
+        #expect(logs.contains("selected=MacBook Pro Microphone [built-in-mic]"))
         service.stop()
     }
 
@@ -514,8 +623,11 @@ struct MacAssistantTests {
         )
         let controllerFactory = FakeCaptureControllerFactory()
         let controller = FakeCaptureController(
-            resolvedInputDeviceUID: builtInMicrophone.uid,
-            resolvedInputDeviceName: builtInMicrophone.name
+            boundInputDeviceID: builtInMicrophone.deviceID,
+            boundInputDeviceUID: builtInMicrophone.uid,
+            boundInputDeviceName: builtInMicrophone.name,
+            deviceInputFormat: AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1),
+            clientInputFormat: AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)
         )
         controllerFactory.queuedControllers = [controller]
         let started = LockedCounter()
@@ -560,12 +672,18 @@ struct MacAssistantTests {
         )
         let controllerFactory = FakeCaptureControllerFactory()
         let firstController = FakeCaptureController(
-            resolvedInputDeviceUID: builtInMicrophone.uid,
-            resolvedInputDeviceName: builtInMicrophone.name
+            boundInputDeviceID: builtInMicrophone.deviceID,
+            boundInputDeviceUID: builtInMicrophone.uid,
+            boundInputDeviceName: builtInMicrophone.name,
+            deviceInputFormat: AVAudioFormat(standardFormatWithSampleRate: 24_000, channels: 1),
+            clientInputFormat: AVAudioFormat(standardFormatWithSampleRate: 24_000, channels: 1)
         )
         let secondController = FakeCaptureController(
-            resolvedInputDeviceUID: builtInMicrophone.uid,
-            resolvedInputDeviceName: builtInMicrophone.name
+            boundInputDeviceID: builtInMicrophone.deviceID,
+            boundInputDeviceUID: builtInMicrophone.uid,
+            boundInputDeviceName: builtInMicrophone.name,
+            deviceInputFormat: AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1),
+            clientInputFormat: AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)
         )
         controllerFactory.queuedControllers = [firstController, secondController]
         let chunkRecorder = LockedChunkRecorder()
@@ -620,12 +738,18 @@ struct MacAssistantTests {
         )
         let controllerFactory = FakeCaptureControllerFactory()
         let firstController = FakeCaptureController(
-            resolvedInputDeviceUID: builtInMicrophone.uid,
-            resolvedInputDeviceName: builtInMicrophone.name
+            boundInputDeviceID: builtInMicrophone.deviceID,
+            boundInputDeviceUID: builtInMicrophone.uid,
+            boundInputDeviceName: builtInMicrophone.name,
+            deviceInputFormat: AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1),
+            clientInputFormat: AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)
         )
         let secondController = FakeCaptureController(
-            resolvedInputDeviceUID: builtInMicrophone.uid,
-            resolvedInputDeviceName: builtInMicrophone.name
+            boundInputDeviceID: builtInMicrophone.deviceID,
+            boundInputDeviceUID: builtInMicrophone.uid,
+            boundInputDeviceName: builtInMicrophone.name,
+            deviceInputFormat: AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1),
+            clientInputFormat: AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)
         )
         controllerFactory.queuedControllers = [firstController, secondController]
         let errors = LockedLogMessages()
@@ -689,8 +813,11 @@ struct MacAssistantTests {
         )
         let controllerFactory = FakeCaptureControllerFactory()
         let controller = FakeCaptureController(
-            resolvedInputDeviceUID: builtInMicrophone.uid,
-            resolvedInputDeviceName: builtInMicrophone.name
+            boundInputDeviceID: builtInMicrophone.deviceID,
+            boundInputDeviceUID: builtInMicrophone.uid,
+            boundInputDeviceName: builtInMicrophone.name,
+            deviceInputFormat: AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1),
+            clientInputFormat: AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)
         )
         controllerFactory.queuedControllers = [controller]
         let logs = LockedLogMessages()
@@ -718,12 +845,103 @@ struct MacAssistantTests {
             chunkHandler: { _ in }
         )
 
-        #expect(logs.contains("[Mic] backend=avcapture version=test-version build=test-build"))
+        #expect(logs.contains("[Mic] backend=auhal version=test-version build=test-build"))
         #expect(logs.contains("Capture session started device=MacBook Pro Microphone [built-in-mic]"))
+        #expect(logs.contains("selected=MacBook Pro Microphone [built-in-mic]"))
         #expect(logs.contains("defaultInput=MacBook Pro Microphone [built-in-mic]"))
         #expect(logs.contains("defaultOutput=My AirPods Pro [airpods-output]"))
         #expect(logs.contains("splitRouteArbitration=engaged"))
+        #expect(logs.contains("deviceFormat=44100Hz/1ch/float32"))
+        #expect(logs.contains("clientFormat=44100Hz/1ch/float32"))
         service.stop()
+    }
+
+    @Test
+    func auhalControllerBindsRequestedDeviceAndRendersInputCallback() async throws {
+        let airPodsMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 202,
+            uid: "airpods-mic",
+            name: "My AirPods Pro",
+            transport: .bluetooth
+        )
+        let fakeUnit = FakeAUHALInputUnit(
+            currentDeviceIDValue: airPodsMicrophone.deviceID,
+            inputDeviceFormatValue: makeFloatStreamDescription(sampleRate: 24_000, channels: 1)
+        )
+        let recorder = LockedPCMBufferRecorder()
+        let controller = try AUHALMicrophoneCaptureControllerFactory(
+            inputUnitFactory: { fakeUnit }
+        ).makeController(
+            selectedInputDevice: airPodsMicrophone,
+            onPCMBuffer: { recorder.append($0) },
+            onError: { error in
+                Issue.record("Unexpected AUHAL callback error: \(error.localizedDescription)")
+            }
+        )
+
+        #expect(fakeUnit.setInputEnabledValues == [true])
+        #expect(fakeUnit.setOutputEnabledValues == [false])
+        #expect(fakeUnit.setCurrentDeviceValues == [airPodsMicrophone.deviceID])
+        #expect(controller.boundInputDeviceID == airPodsMicrophone.deviceID)
+        #expect(controller.boundInputDeviceUID == airPodsMicrophone.uid)
+        #expect(controller.boundInputDeviceName == airPodsMicrophone.name)
+        #expect(abs((controller.deviceInputFormat?.sampleRate ?? 0) - 24_000) < 0.5)
+        #expect(abs((controller.clientInputFormat?.sampleRate ?? 0) - 24_000) < 0.5)
+
+        try controller.start()
+        #expect(fakeUnit.initializeCallCount == 1)
+        #expect(fakeUnit.startCallCount == 1)
+
+        fakeUnit.invokeInputCallback(frameCount: 2_400)
+        try? await Task.sleep(for: .milliseconds(10))
+
+        let buffers = recorder.buffers
+        #expect(buffers.count == 1)
+        #expect(abs(buffers[0].format.sampleRate - 24_000) < 0.5)
+        #expect(buffers[0].frameLength == 2_400)
+
+        controller.stop()
+        #expect(fakeUnit.stopCallCount == 1)
+        #expect(fakeUnit.uninitializeCallCount == 1)
+    }
+
+    @Test
+    func auhalControllerPropagatesStartErrors() throws {
+        let builtInMicrophone = MicrophoneCaptureService.InputDevice(
+            deviceID: 101,
+            uid: "built-in-mic",
+            name: "MacBook Pro Microphone",
+            transport: .builtIn
+        )
+        let fakeUnit = FakeAUHALInputUnit(
+            currentDeviceIDValue: builtInMicrophone.deviceID,
+            inputDeviceFormatValue: makeFloatStreamDescription(sampleRate: 44_100, channels: 1)
+        )
+        fakeUnit.startError = NSError(
+            domain: NSOSStatusErrorDomain,
+            code: -10868,
+            userInfo: [NSLocalizedDescriptionKey: "The operation couldn’t be completed. (OSStatus error -10868.)"]
+        )
+
+        let controller = try AUHALMicrophoneCaptureControllerFactory(
+            inputUnitFactory: { fakeUnit }
+        ).makeController(
+            selectedInputDevice: builtInMicrophone,
+            onPCMBuffer: { _ in },
+            onError: { _ in }
+        )
+
+        do {
+            try controller.start()
+            Issue.record("Expected controller.start() to throw.")
+        } catch {
+            let nsError = error as NSError
+            #expect(nsError.domain == NSOSStatusErrorDomain)
+            #expect(nsError.code == -10868)
+        }
+        #expect(fakeUnit.initializeCallCount == 1)
+        #expect(fakeUnit.uninitializeCallCount == 1)
+        #expect(fakeUnit.startCallCount == 1)
     }
 
     @Test
@@ -1625,7 +1843,7 @@ struct MacAssistantTests {
         microphoneService.emitChunk()
         await settleVoiceCallbacks()
 
-        #expect(model.runtimeLogsText.contains("[Mic] backend=avcapture version=test build=test"))
+        #expect(model.runtimeLogsText.contains("[Mic] backend=auhal version=test build=test"))
         #expect(model.runtimeLogsText.contains("[Mic] Starting capture"))
         #expect(model.runtimeLogsText.contains("defaultOutput=My AirPods Pro [airpods-output]"))
         #expect(model.runtimeLogsText.contains("[Mic] Split-route preflight engaged"))
@@ -1735,6 +1953,7 @@ struct MacAssistantTests {
         #expect(model.runtimeLogsText.contains("[Mic] Starting capture preference=automatic (built-in preferred) resolved=MacBook Pro Microphone [built-in-mic] defaultOutput=MacBook Pro Speakers [built-in-output]"))
         #expect(model.runtimeLogsText.contains("[Mic] Split-route preflight skipped requestedInput=MacBook Pro Microphone [built-in-mic] defaultOutput=MacBook Pro Speakers [built-in-output]"))
         #expect(model.runtimeLogsText.contains("[Mic] Capture session started device=MacBook Pro Microphone [built-in-mic]"))
+        #expect(model.runtimeLogsText.contains("selected=MacBook Pro Microphone [built-in-mic]"))
         #expect(model.runtimeLogsText.contains("[Mic] First converted chunk"))
     }
 
@@ -2197,13 +2416,17 @@ struct MacAssistantTests {
 
     @MainActor
     private func settleVoiceCallbacks() async {
+        for _ in 0..<6 {
+            await Task.yield()
+        }
+        try? await Task.sleep(for: .milliseconds(1))
         for _ in 0..<2 {
             await Task.yield()
         }
     }
 }
 
-private final class FakeMicrophoneCaptureService: MicrophoneCaptureServicing {
+private final class FakeMicrophoneCaptureService: MicrophoneCaptureServicing, @unchecked Sendable {
     var onInputDevicesChanged: (@Sendable () -> Void)?
     var status: MicrophoneCaptureService.AuthorizationStatus = .authorized
     var requestAccessResult = true
@@ -2265,12 +2488,14 @@ private final class FakeMicrophoneCaptureService: MicrophoneCaptureServicing {
         if !startResults.isEmpty {
             let result = startResults.removeFirst()
             if case .failure(let error) = result {
-                logHandler?("[Mic] backend=avcapture version=test build=test")
+                logHandler?("[Mic] backend=auhal version=test build=test")
                 logHandler?(
                     "[Mic] Failed to start capture requested=\(describe(device: inputDevices.first(where: { $0.uid == preferredInputDeviceUID }))) " +
-                    "resolved=\(describe(device: lastStartedInputDevice)) " +
+                    "selected=\(describe(device: lastStartedInputDevice)) " +
+                    "device=\(describe(device: lastStartedInputDevice)) " +
                     "defaultInput=\(describe(device: defaultInputDevice())) " +
-                    "defaultOutput=system-default splitRouteArbitration=skipped: \(error.localizedDescription)"
+                    "defaultOutput=system-default splitRouteArbitration=skipped " +
+                    "deviceFormat=44100Hz/1ch/float32 clientFormat=44100Hz/1ch/float32: \(error.localizedDescription)"
                 )
                 throw error
             }
@@ -2281,12 +2506,14 @@ private final class FakeMicrophoneCaptureService: MicrophoneCaptureServicing {
         self.onError = onError
         self.logHandler = logHandler
         self.chunkHandler = chunkHandler
-        logHandler?("[Mic] backend=avcapture version=test build=test")
+        logHandler?("[Mic] backend=auhal version=test build=test")
         logHandler?(
             "[Mic] Capture session started device=\(describe(device: lastStartedInputDevice)) " +
+            "selected=\(describe(device: lastStartedInputDevice)) " +
             "requested=\(describe(device: inputDevices.first(where: { $0.uid == preferredInputDeviceUID }))) " +
             "defaultInput=\(describe(device: defaultInputDevice())) " +
-            "defaultOutput=system-default splitRouteArbitration=skipped"
+            "defaultOutput=system-default splitRouteArbitration=skipped " +
+            "deviceFormat=44100Hz/1ch/float32 clientFormat=44100Hz/1ch/float32"
         )
         onStarted?()
     }
@@ -2420,10 +2647,10 @@ private final class FakeMicrophoneRouteCoordinator: MicrophoneRouteCoordinating,
 
 private final class FakeCaptureControllerFactory: MicrophoneCaptureControllerFactory, @unchecked Sendable {
     var queuedControllers: [FakeCaptureController] = []
-    private(set) var requestedInputDeviceUIDs: [String?] = []
+    private(set) var selectedInputDeviceUIDs: [String?] = []
 
     func makeController(
-        preferredInputDeviceUID: String?,
+        selectedInputDevice: MicrophoneCaptureService.InputDevice?,
         onPCMBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void,
         onError: @escaping @Sendable (Error) -> Void
     ) throws -> any MicrophoneCaptureControlling {
@@ -2436,27 +2663,39 @@ private final class FakeCaptureControllerFactory: MicrophoneCaptureControllerFac
         }
 
         let controller = queuedControllers.removeFirst()
-        controller.requestedInputDeviceUID = preferredInputDeviceUID
+        controller.selectedInputDevice = selectedInputDevice
         controller.onPCMBuffer = onPCMBuffer
         controller.onError = onError
-        requestedInputDeviceUIDs.append(preferredInputDeviceUID)
+        selectedInputDeviceUIDs.append(selectedInputDevice?.uid)
         return controller
     }
 }
 
 private final class FakeCaptureController: MicrophoneCaptureControlling, @unchecked Sendable {
-    var requestedInputDeviceUID: String?
-    let resolvedInputDeviceUID: String?
-    let resolvedInputDeviceName: String?
+    var selectedInputDevice: MicrophoneCaptureService.InputDevice?
+    let boundInputDeviceID: AudioDeviceID?
+    let boundInputDeviceUID: String?
+    let boundInputDeviceName: String?
+    let deviceInputFormat: AVAudioFormat?
+    let clientInputFormat: AVAudioFormat?
     private(set) var startCallCount = 0
     private(set) var stopCallCount = 0
     var startError: Error?
     var onPCMBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
     var onError: (@Sendable (Error) -> Void)?
 
-    init(resolvedInputDeviceUID: String?, resolvedInputDeviceName: String?) {
-        self.resolvedInputDeviceUID = resolvedInputDeviceUID
-        self.resolvedInputDeviceName = resolvedInputDeviceName
+    init(
+        boundInputDeviceID: AudioDeviceID?,
+        boundInputDeviceUID: String?,
+        boundInputDeviceName: String?,
+        deviceInputFormat: AVAudioFormat?,
+        clientInputFormat: AVAudioFormat?
+    ) {
+        self.boundInputDeviceID = boundInputDeviceID
+        self.boundInputDeviceUID = boundInputDeviceUID
+        self.boundInputDeviceName = boundInputDeviceName
+        self.deviceInputFormat = deviceInputFormat
+        self.clientInputFormat = clientInputFormat
     }
 
     func start() throws {
@@ -2476,6 +2715,121 @@ private final class FakeCaptureController: MicrophoneCaptureControlling, @unchec
 
     func emitError(_ error: Error) {
         onError?(error)
+    }
+}
+
+private final class FakeAUHALInputUnit: AUHALInputUnitControlling, @unchecked Sendable {
+    private(set) var setInputEnabledValues: [Bool] = []
+    private(set) var setOutputEnabledValues: [Bool] = []
+    private(set) var setCurrentDeviceValues: [AudioDeviceID] = []
+    private(set) var setClientInputFormats: [AudioStreamBasicDescription] = []
+    private(set) var initializeCallCount = 0
+    private(set) var startCallCount = 0
+    private(set) var stopCallCount = 0
+    private(set) var uninitializeCallCount = 0
+    var currentDeviceIDValue: AudioDeviceID
+    var inputDeviceFormatValue: AudioStreamBasicDescription
+    var startError: Error?
+    var renderError: Error?
+    private var inputCallback: AURenderCallbackStruct?
+
+    init(currentDeviceIDValue: AudioDeviceID, inputDeviceFormatValue: AudioStreamBasicDescription) {
+        self.currentDeviceIDValue = currentDeviceIDValue
+        self.inputDeviceFormatValue = inputDeviceFormatValue
+    }
+
+    func setInputEnabled(_ enabled: Bool) throws {
+        setInputEnabledValues.append(enabled)
+    }
+
+    func setOutputEnabled(_ enabled: Bool) throws {
+        setOutputEnabledValues.append(enabled)
+    }
+
+    func setCurrentDevice(_ deviceID: AudioDeviceID) throws {
+        setCurrentDeviceValues.append(deviceID)
+        currentDeviceIDValue = deviceID
+    }
+
+    func currentDeviceID() throws -> AudioDeviceID {
+        currentDeviceIDValue
+    }
+
+    func inputDeviceFormat() throws -> AudioStreamBasicDescription {
+        inputDeviceFormatValue
+    }
+
+    func setClientInputFormat(_ format: AudioStreamBasicDescription) throws {
+        setClientInputFormats.append(format)
+    }
+
+    func setInputCallback(_ callback: AURenderCallbackStruct) throws {
+        inputCallback = callback
+    }
+
+    func initialize() throws {
+        initializeCallCount += 1
+    }
+
+    func start() throws {
+        startCallCount += 1
+        if let startError {
+            throw startError
+        }
+    }
+
+    func render(
+        ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+        timeStamp: UnsafePointer<AudioTimeStamp>,
+        busNumber: UInt32,
+        frameCount: UInt32,
+        ioData: UnsafeMutablePointer<AudioBufferList>
+    ) throws {
+        if let renderError {
+            throw renderError
+        }
+
+        let audioBuffers = UnsafeMutableAudioBufferListPointer(ioData)
+        let format = AVAudioFormat(streamDescription: withUnsafePointer(to: inputDeviceFormatValue) { pointer in
+            UnsafeMutablePointer(mutating: pointer)
+        })!
+        let bytesPerFrame = Int(format.streamDescription.pointee.mBytesPerFrame)
+        let byteCount = Int(frameCount) * max(bytesPerFrame, MemoryLayout<Float>.size)
+
+        for index in audioBuffers.indices {
+            guard let data = audioBuffers[index].mData else { continue }
+            memset(data, 0, byteCount)
+            audioBuffers[index].mDataByteSize = UInt32(byteCount)
+        }
+    }
+
+    func stop() {
+        stopCallCount += 1
+    }
+
+    func uninitialize() {
+        uninitializeCallCount += 1
+    }
+
+    func invokeInputCallback(frameCount: UInt32) {
+        guard
+            let callback = inputCallback,
+            let inputProc = callback.inputProc,
+            let refCon = callback.inputProcRefCon
+        else {
+            Issue.record("Expected AUHAL input callback to be configured.")
+            return
+        }
+        var flags = AudioUnitRenderActionFlags()
+        var timestamp = AudioTimeStamp()
+        _ = inputProc(
+            refCon,
+            &flags,
+            &timestamp,
+            1,
+            frameCount,
+            nil
+        )
     }
 }
 
@@ -2534,6 +2888,23 @@ private final class LockedChunkRecorder: @unchecked Sendable {
     }
 }
 
+private final class LockedPCMBufferRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [AVAudioPCMBuffer] = []
+
+    var buffers: [AVAudioPCMBuffer] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func append(_ buffer: AVAudioPCMBuffer) {
+        lock.lock()
+        storage.append(buffer)
+        lock.unlock()
+    }
+}
+
 private func makeFloatPCMBuffer(
     sampleRate: Double,
     frameCount: AVAudioFrameCount,
@@ -2557,6 +2928,14 @@ private func makeFloatPCMBuffer(
     }
 
     return buffer
+}
+
+private func makeFloatStreamDescription(
+    sampleRate: Double,
+    channels: AVAudioChannelCount
+) -> AudioStreamBasicDescription {
+    let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: channels)!
+    return format.streamDescription.pointee
 }
 
 @MainActor
