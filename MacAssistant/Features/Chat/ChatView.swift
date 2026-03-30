@@ -121,16 +121,24 @@ struct ChatView: View {
     private func itemView(_ item: ConversationItem) -> some View {
         switch item {
         case .userVoiceDraft(let draft):
-            BubbleView(
-                text: draft.text.isEmpty ? "Listening…" : draft.text,
-                imageAttachment: draft.imageAttachment,
-                alignment: .trailing,
-                tint: AppTheme.accent.opacity(0.14),
-                footer: nil,
-                isCancelled: draft.isCancelled,
-                rendersMarkdown: false,
-                onTapImage: { expandedImageAttachment = $0 }
-            )
+            if draft.text.isEmpty && (model.isVoiceDraftLoading || model.isFinalizingVoiceRecording) {
+                VoiceDraftLoadingBubble(
+                    imageAttachment: draft.imageAttachment,
+                    title: model.voiceDraftLoadingLabel,
+                    onTapImage: { expandedImageAttachment = $0 }
+                )
+            } else {
+                BubbleView(
+                    text: draft.text.isEmpty ? "Listening…" : draft.text,
+                    imageAttachment: draft.imageAttachment,
+                    alignment: .trailing,
+                    tint: AppTheme.accent.opacity(0.14),
+                    footer: nil,
+                    isCancelled: draft.isCancelled,
+                    rendersMarkdown: false,
+                    onTapImage: { expandedImageAttachment = $0 }
+                )
+            }
         case .userMessage(let message):
             UserMessageRow(
                 model: model,
@@ -660,16 +668,28 @@ private struct ComposerBar: View {
                         model.toggleRecording()
                     }
                 } label: {
-                    Image(systemName: model.isRecording ? "stop.fill" : "mic.fill")
-                        .font(.system(size: 14, weight: .semibold))
-                        .frame(width: 32, height: 32)
+                    Group {
+                        if model.isRecording && model.isVoiceDraftLoading {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(AppTheme.secondaryText)
+                        } else {
+                            Image(systemName: recordingButtonIconName)
+                                .font(.system(size: 14, weight: .semibold))
+                        }
+                    }
+                    .frame(width: 32, height: 32)
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(model.isRecording ? Color.white : Color.primary)
+                .foregroundStyle(recordingButtonForegroundStyle)
                 .background(
                     Circle()
-                        .fill(model.isRecording ? AppTheme.destructive : AppTheme.badgeFill)
+                        .fill(recordingButtonBackgroundStyle)
                 )
+                .overlay {
+                    Circle()
+                        .strokeBorder(recordingButtonStrokeStyle, lineWidth: model.isVoiceDraftLoading ? 1 : 0)
+                }
                 .disabled(model.isFinalizingVoiceRecording || (!model.isRecording && (model.isComposerLocked || !model.isMicReady)))
                 .overlay(alignment: .topTrailing) {
                     if !model.hasLiveVoiceDraft && !model.isMicReady && model.phase == .ready {
@@ -732,14 +752,8 @@ private struct ComposerBar: View {
     }
 
     private var helperText: String {
-        if model.isWaitingForMicrophoneAudio {
-            return "Waiting for microphone audio. Press send to finish, or stop to discard the draft."
-        }
-        if model.isRecording {
-            return "Listening for speech. Press send to use it, or stop to discard it."
-        }
-        if model.isFinalizingVoiceRecording {
-            return "Finalizing speech. The live transcript will submit as soon as the last chunk is processed."
+        if model.hasLiveVoiceDraft {
+            return model.voiceRecordingHelperText
         }
         if model.isReplySpeechActive {
             return "Reading the response aloud. Press stop to silence it."
@@ -747,7 +761,99 @@ private struct ComposerBar: View {
         if model.isComposerLocked {
             return "MacAssistant is working. You can keep typing, or press stop to cancel the current response."
         }
-        return "Press Return to send, or use the mic for a spoken request."
+        return model.voiceRecordingHelperText
+    }
+
+    private var recordingButtonIconName: String {
+        if model.isRecording, !model.isVoiceDraftLoading {
+            return "stop.fill"
+        }
+        return "mic.fill"
+    }
+
+    private var recordingButtonForegroundStyle: Color {
+        if model.isRecording, !model.isVoiceDraftLoading {
+            return .white
+        }
+        return Color.primary
+    }
+
+    private var recordingButtonBackgroundStyle: Color {
+        if model.isRecording, !model.isVoiceDraftLoading {
+            return AppTheme.destructive
+        }
+        if model.isVoiceDraftLoading {
+            return AppTheme.badgeFill.opacity(0.72)
+        }
+        return AppTheme.badgeFill
+    }
+
+    private var recordingButtonStrokeStyle: Color {
+        model.isVoiceDraftLoading ? AppTheme.separator.opacity(0.9) : .clear
+    }
+}
+
+private struct VoiceDraftLoadingBubble: View {
+    let imageAttachment: ConversationImageAttachment?
+    let title: String
+    let onTapImage: (ConversationImageAttachment) -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            Spacer(minLength: 0)
+
+            VStack(alignment: .trailing, spacing: imageAttachment == nil ? 0 : 10) {
+                if let imageAttachment {
+                    MessageImagePreview(
+                        attachment: imageAttachment,
+                        open: { onTapImage(imageAttachment) }
+                    )
+                }
+
+                HStack(spacing: 10) {
+                    Image(systemName: "mic.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(AppTheme.secondaryText)
+
+                    Text(title)
+                        .font(.body)
+                        .foregroundStyle(AppTheme.secondaryText)
+
+                    LoadingDotsView()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 11)
+                .background(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(AppTheme.badgeFill.opacity(0.72))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .strokeBorder(AppTheme.separator, lineWidth: 1)
+                )
+            }
+        }
+    }
+}
+
+private struct LoadingDotsView: View {
+    private let interval = 0.34
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: interval)) { context in
+            let activeIndex = Int(context.date.timeIntervalSinceReferenceDate / interval) % 3
+
+            HStack(spacing: 4) {
+                ForEach(0..<3, id: \.self) { index in
+                    Circle()
+                        .fill(AppTheme.secondaryText)
+                        .frame(width: 5, height: 5)
+                        .scaleEffect(index == activeIndex ? 1 : 0.7)
+                        .opacity(index == activeIndex ? 1 : 0.28)
+                }
+            }
+        }
+        .frame(width: 24, height: 8)
     }
 }
 

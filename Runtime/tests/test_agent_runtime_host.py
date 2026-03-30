@@ -101,6 +101,105 @@ class BufferedPreviewSessionTests(unittest.IsolatedAsyncioTestCase):
             session.cancel()
 
 
+class VoxtralRealtimeSessionTests(unittest.TestCase):
+    def make_session(self) -> tuple[runtime_host.VoxtralRealtimeSTTSession, list[str], list[str]]:
+        partials: list[str] = []
+        logs: list[str] = []
+        session = runtime_host.VoxtralRealtimeSTTSession.__new__(
+            runtime_host.VoxtralRealtimeSTTSession
+        )
+        session._preview_text = ""
+        session._last_emitted_text = ""
+        session._full_text = ""
+        session._current_segment_text = ""
+        session._live_partial_seen = False
+        session._last_live_partial_at = None
+        session._first_partial_at = None
+        session._audio_seconds_ingested = 12.0
+        session._session_started_at = time.monotonic() - 5.0
+        session._schedule_partial = partials.append
+        session._log_debug = logs.append
+        session._audio_condition = threading.Condition()
+        session._pcm_bytes = bytearray()
+        session._stopped = False
+        session._cancelled = False
+        session._waiting_for_samples = None
+        return session, partials, logs
+
+    def test_emit_cumulative_text_uses_live_text_only(self) -> None:
+        session, partials, _ = self.make_session()
+        session._current_segment_text = "hello there"
+
+        session._emit_cumulative_text()
+        session._emit_cumulative_text()
+        session._current_segment_text = "hello there again"
+        session._emit_cumulative_text()
+
+        self.assertEqual(partials, ["hello there", "hello there again"])
+
+    def test_wait_for_audio_watermark_blocks_until_required_samples(self) -> None:
+        session, _, logs = self.make_session()
+        finished = threading.Event()
+
+        def waiter() -> None:
+            session._wait_for_audio_watermark(8)
+            finished.set()
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        time.sleep(0.02)
+
+        self.assertFalse(finished.is_set())
+        with session._audio_condition:
+            session._pcm_bytes.extend(b"\x00\x01" * 8)
+            session._audio_condition.notify_all()
+
+        thread.join(timeout=1.0)
+        self.assertTrue(finished.is_set())
+        self.assertEqual(
+            logs,
+            [
+                "waiting for audio available_samples=0 required_samples=8",
+                "resumed live decode available_samples=8 required_samples=8",
+            ],
+        )
+
+    def test_audio_slice_reads_requested_sample_window(self) -> None:
+        session, _, _ = self.make_session()
+        with session._audio_condition:
+            session._pcm_bytes.extend(
+                (np.array([0, 16384, -16384, 32767], dtype=np.int16)).tobytes()
+            )
+
+        sliced = session._audio_slice(1, 3)
+
+        np.testing.assert_allclose(
+            sliced,
+            np.array([16384, -16384], dtype=np.float32) / 32768.0,
+        )
+
+    def test_run_worker_never_invokes_snapshot_transcription(self) -> None:
+        session, _, _ = self.make_session()
+        calls: list[object] = []
+        session._model = object()
+        session._model_lock = threading.Lock()
+        session._prime_left_pad_prefix = lambda: calls.append("prime")
+        session._advance_stream = lambda finalize: calls.append(("advance", finalize))
+        session._next_required_audio_samples = lambda: 9000
+        session._wait_for_audio_watermark = (
+            lambda required: (calls.append(("wait", required)), setattr(session, "_stopped", True))
+        )
+        session._flush_stream = lambda: calls.append("flush")
+        session._transcribe_snapshot = lambda pcm_bytes, transcription_delay_ms: calls.append("snapshot")
+        session._schedule_error = lambda message: calls.append(("error", message))
+
+        with patch.object(runtime_host, "mlx_wired_limit", return_value=runtime_host.nullcontext()):
+            session._run_worker()
+
+        self.assertNotIn("snapshot", calls)
+        self.assertIn("flush", calls)
+
+
 class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
     async def wait_for_condition(
         self,
@@ -468,7 +567,7 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(event.get("channels") == 1 for event in audio_events))
         self.assertTrue(all(event.get("audioEncoding") == "pcm_s16le" for event in audio_events))
 
-    async def test_send_text_with_spoken_reply_uses_streamed_pcm_chunk_path(self) -> None:
+    async def test_send_text_with_streamed_spoken_reply_emits_audio_before_final_assistant_delta(self) -> None:
         class ReplyHost(TestRuntimeHost):
             def __init__(self) -> None:
                 super().__init__()
@@ -481,7 +580,10 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
                 tool_schemas: list[dict[str, object]],
                 turn_id: str,
             ) -> runtime_host.AssistantStepResult:
-                return runtime_host.AssistantStepResult(text="Hello", tool_calls=[])
+                return runtime_host.AssistantStepResult(
+                    text="Hello there. This reply keeps streaming while speech starts.",
+                    tool_calls=[],
+                )
 
             def iter_tts_pcm_chunks(
                 self,
@@ -500,7 +602,10 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
                 "turnID": "turn-reply-stream",
                 "text": "Say hello",
                 "speakReply": True,
-                "arguments": {"voice_preset": "casual_male"},
+                "arguments": {
+                    "voice_preset": "casual_male",
+                    "stream_reply_speech": True,
+                },
             }
         )
         await self.wait_for_condition(
@@ -514,11 +619,85 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
         audio_events = [
             event for event in host.events if event.get("type") == "audio_chunk"
         ]
-        self.assertEqual(len(audio_events), 2)
-        self.assertEqual(
-            [base64.b64decode(event["chunkBase64"]) for event in audio_events],
-            [b"one", b"two"],
+        self.assertGreaterEqual(len(audio_events), 2)
+        self.assertTrue(
+            set(base64.b64decode(event["chunkBase64"]) for event in audio_events).issubset(
+                {b"one", b"two"}
+            )
         )
+        audio_index = next(
+            index
+            for index, event in enumerate(host.events)
+            if event.get("type") == "audio_chunk"
+        )
+        final_segment_index = max(
+            index
+            for index, event in enumerate(host.events)
+            if event.get("type") == "assistant_delta"
+            and event.get("isFinalSegment") is True
+        )
+        self.assertLess(audio_index, final_segment_index)
+
+    async def test_send_text_with_streaming_disabled_waits_for_full_assistant_text_before_audio(self) -> None:
+        class ReplyHost(TestRuntimeHost):
+            def __init__(self) -> None:
+                super().__init__()
+                self.tts_model = object()
+
+            async def generate_assistant_step(
+                self,
+                messages: list[dict[str, object]],
+                *,
+                tool_schemas: list[dict[str, object]],
+                turn_id: str,
+            ) -> runtime_host.AssistantStepResult:
+                return runtime_host.AssistantStepResult(
+                    text="Hello there. This reply finishes before speech starts.",
+                    tool_calls=[],
+                )
+
+            def iter_tts_pcm_chunks(
+                self,
+                *,
+                text: str,
+                voice_preset: str,
+                cancel_event: threading.Event | None = None,
+            ):
+                yield b"later"
+
+        host = ReplyHost()
+        await host.handle_command(
+            {
+                "type": "send_text",
+                "turnID": "turn-reply-nonstream",
+                "text": "Say hello",
+                "speakReply": True,
+                "arguments": {
+                    "voice_preset": "casual_male",
+                    "stream_reply_speech": False,
+                },
+            }
+        )
+        await self.wait_for_condition(
+            lambda: any(
+                event.get("type") == "turn_finished"
+                and event.get("turnID") == "turn-reply-nonstream"
+                for event in host.events
+            )
+        )
+
+        audio_index = next(
+            index
+            for index, event in enumerate(host.events)
+            if event.get("type") == "audio_chunk"
+        )
+        final_segment_index = max(
+            index
+            for index, event in enumerate(host.events)
+            if event.get("type") == "assistant_delta"
+            and event.get("isFinalSegment") is True
+        )
+        self.assertGreater(audio_index, final_segment_index)
 
     @unittest.skipUnless(HAS_MLX_AUDIO, "mlx_audio is required for tokenizer patch coverage.")
     def test_patch_tts_runtime_replaces_broken_tokenizer_with_tekken_shim(self) -> None:
@@ -819,6 +998,32 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
             runtime_host.VoxtralStreamingChunk(8_760, 13_000, False),
         )
 
+    def test_streaming_processor_reports_next_required_audio_length(self) -> None:
+        processor = runtime_host.VoxtralStreamingProcessor(
+            sample_rate=16_000,
+            hop_length=160,
+            window_size=400,
+            frame_rate=12.5,
+            num_delay_tokens=6,
+        )
+
+        self.assertEqual(
+            processor.next_required_audio_length(audio_length=0, finalize=False),
+            9_000,
+        )
+
+        first_chunk = processor.next_chunk(audio_length=9_000, finalize=False)
+        self.assertEqual(
+            first_chunk,
+            runtime_host.VoxtralStreamingChunk(0, 9_000, True),
+        )
+        processor.advance(mel_frames=56, is_first_audio_chunk=True)
+
+        self.assertEqual(
+            processor.next_required_audio_length(audio_length=9_000, finalize=False),
+            10_440,
+        )
+
     def test_streaming_mel_matches_voxtral_filter_layout(self) -> None:
         class FakeAudioEncodingArgs:
             global_log_mel_max = 1.5
@@ -933,19 +1138,15 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
             runtime_host.VoxtralRealtimeSTTSession
         )
         session._stopped = False
-        session._stop_sentinel = object()
-        session._audio_queue = runtime_host.queue.Queue()
-        session._updated = asyncio.Event()
+        session._audio_condition = threading.Condition()
         session._worker_task = asyncio.create_task(asyncio.sleep(0))
-        session._preview_task = None
         session._pcm_bytes = bytearray(b"\x00\x01" * 10)
         session._cancelled = False
-        session._final_transcribe = None
+        session._worker_failed = False
         session._sample_rate = 16_000
         session._preview_text = ""
         session._full_text = ""
         session._current_segment_text = ""
-        session._live_partial_seen = False
         session._transcribe_snapshot = lambda pcm_bytes, transcription_delay_ms: "rescued"
 
         final_text = await session.finish()
@@ -960,12 +1161,10 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
         session._preview_text = "preview text"
         session._full_text = ""
         session._current_segment_text = ""
-        session._live_partial_seen = False
 
         self.assertEqual(session._final_text(), "preview text")
 
         session._full_text = "live text"
-        session._live_partial_seen = True
         self.assertEqual(session._final_text(), "live text")
 
     async def test_stop_recording_uses_live_session_when_present(self) -> None:
@@ -1003,7 +1202,7 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
                 super().__init__()
                 self.session = FakeRealtimeSession()
                 self.events: list[dict[str, object]] = []
-                self.run_turn_calls: list[tuple[str, str, list[dict[str, object]], bool, str]] = []
+                self.run_turn_calls: list[tuple[str, str, list[dict[str, object]], bool, str, bool]] = []
                 self.transcribe_calls: list[tuple[int, int]] = []
                 self.stt_model = FakeRealtimeModel()
                 self.model_states["stt_model"] = runtime_host.ModelState(
@@ -1035,8 +1234,9 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
                 attachments: list[dict[str, object]] | None,
                 speak_reply: bool,
                 voice_preset: str,
+                stream_reply_speech: bool = True,
             ) -> None:
-                self.run_turn_calls.append((turn_id, user_text, attachments or [], speak_reply, voice_preset))
+                self.run_turn_calls.append((turn_id, user_text, attachments or [], speak_reply, voice_preset, stream_reply_speech))
 
             def create_stt_session(self, turn_id: str) -> runtime_host.BaseSTTSession:
                 return self.session
@@ -1082,6 +1282,7 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
                     [{"type": "image", "file_path": "/tmp/image.png", "display_name": "image.png"}],
                     True,
                     "casual_male",
+                    True,
                 )
             ],
         )
@@ -1097,7 +1298,7 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self) -> None:
                 super().__init__()
                 self.events: list[dict[str, object]] = []
-                self.run_turn_calls: list[tuple[str, str, list[dict[str, object]], bool, str]] = []
+                self.run_turn_calls: list[tuple[str, str, list[dict[str, object]], bool, str, bool]] = []
                 self.transcribe_calls: list[tuple[int, int]] = []
                 self.stt_model = FakeFallbackModel()
                 self.model_states["stt_model"] = runtime_host.ModelState(
@@ -1132,8 +1333,9 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
                 attachments: list[dict[str, object]] | None,
                 speak_reply: bool,
                 voice_preset: str,
+                stream_reply_speech: bool = True,
             ) -> None:
-                self.run_turn_calls.append((turn_id, user_text, attachments or [], speak_reply, voice_preset))
+                self.run_turn_calls.append((turn_id, user_text, attachments or [], speak_reply, voice_preset, stream_reply_speech))
 
         host = FallbackHost()
         chunk = b"\x01\x02" * 1600
@@ -1181,7 +1383,81 @@ class RuntimeHostStreamingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             host.run_turn_calls,
-            [("turn-2", "final-12800", [], False, "casual_male")],
+            [("turn-2", "final-12800", [], False, "casual_male", True)],
+        )
+
+    async def test_stop_recording_preserves_stream_reply_speech_flag_into_run_turn(self) -> None:
+        class FakeRealtimeConfig:
+            model_type = "voxtral_realtime"
+
+        class FakeRealtimeModel:
+            config = FakeRealtimeConfig()
+            encoder = object()
+            decoder = object()
+            _tokenizer = object()
+            _mel_filters = object()
+
+        class FakeRealtimeSession(runtime_host.BaseSTTSession):
+            def append_pcm_bytes(self, pcm_bytes: bytes) -> None:
+                return None
+
+            async def finish(self) -> str:
+                return "voice transcript"
+
+            def cancel(self) -> None:
+                return None
+
+        class RecordingHost(runtime_host.RuntimeHost):
+            def __init__(self) -> None:
+                super().__init__()
+                self.events: list[dict[str, object]] = []
+                self.run_turn_calls: list[tuple[str, str, list[dict[str, object]], bool, str, bool]] = []
+                self.session = FakeRealtimeSession()
+                self.stt_model = FakeRealtimeModel()
+                self.model_states["stt_model"] = runtime_host.ModelState(
+                    installed=True,
+                    warm=True,
+                    path="/tmp/stt",
+                    last_error=None,
+                )
+
+            def emit(self, payload: dict[str, object]) -> None:
+                self.events.append(payload)
+
+            async def warm_model(self, model_id: str, arguments: dict[str, object]) -> None:
+                return None
+
+            async def run_turn(
+                self,
+                turn_id: str,
+                user_text: str,
+                attachments: list[dict[str, object]] | None,
+                speak_reply: bool,
+                voice_preset: str,
+                stream_reply_speech: bool = True,
+            ) -> None:
+                self.run_turn_calls.append((turn_id, user_text, attachments or [], speak_reply, voice_preset, stream_reply_speech))
+
+            def create_stt_session(self, turn_id: str) -> runtime_host.BaseSTTSession:
+                return self.session
+
+        host = RecordingHost()
+
+        await host.start_recording(
+            {
+                "turnID": "turn-flag",
+                "speakReply": True,
+                "arguments": {
+                    "voice_preset": "casual_male",
+                    "stream_reply_speech": False,
+                },
+            }
+        )
+        await host.stop_recording("turn-flag")
+
+        self.assertEqual(
+            host.run_turn_calls,
+            [("turn-flag", "voice transcript", [], True, "casual_male", False)],
         )
 
     def test_realtime_session_detection_is_specific_to_voxtral(self) -> None:
@@ -1775,6 +2051,7 @@ class SequentialToolLoopTests(unittest.IsolatedAsyncioTestCase):
             attachments=[],
             speak_reply=True,
             voice_preset="casual_male",
+            stream_reply_speech=False,
         )
 
         events = host.events
@@ -1791,6 +2068,78 @@ class SequentialToolLoopTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertGreater(audio_index, final_segment_index)
         self.assertGreater(final_segment_index, intermediate_segment_index)
+
+    async def test_tool_followup_spoken_reply_can_start_before_final_segment_when_streaming_enabled(self) -> None:
+        class SpeakingLoopHost(TestRuntimeHost):
+            def __init__(self) -> None:
+                super().__init__()
+                self.tts_model = object()
+                self.step_calls = 0
+
+            async def generate_assistant_step(
+                self,
+                messages: list[dict[str, object]],
+                *,
+                tool_schemas: list[dict[str, object]],
+                turn_id: str,
+            ) -> runtime_host.AssistantStepResult:
+                if self.step_calls == 0:
+                    self.step_calls += 1
+                    return runtime_host.AssistantStepResult(
+                        text="Working on it.",
+                        tool_calls=[
+                            runtime_host.ToolCallRequest(
+                                name="get_scripting_tips",
+                                arguments={"search_term": "Finder"},
+                            )
+                        ],
+                    )
+                return runtime_host.AssistantStepResult(
+                    text="Finished with the answer. Here is the follow-up reply.",
+                    tool_calls=[],
+                )
+
+            async def execute_tool(
+                self,
+                tool_name: str,
+                tool_arguments: dict[str, object],
+            ) -> str:
+                return "ok"
+
+            def iter_tts_pcm_chunks(
+                self,
+                *,
+                text: str,
+                voice_preset: str,
+                cancel_event: threading.Event | None = None,
+            ):
+                yield b"audio"
+
+        host = SpeakingLoopHost()
+
+        await host.run_turn(
+            turn_id="speech-turn-streaming",
+            user_text="Check and speak",
+            attachments=[],
+            speak_reply=True,
+            voice_preset="casual_male",
+            stream_reply_speech=True,
+        )
+
+        events = host.events
+        audio_index = next(index for index, event in enumerate(events) if event.get("type") == "audio_chunk")
+        final_segment_index = max(
+            index
+            for index, event in enumerate(events)
+            if event.get("type") == "assistant_delta" and event.get("isFinalSegment") is True
+        )
+        intermediate_segment_index = max(
+            index
+            for index, event in enumerate(events)
+            if event.get("type") == "assistant_delta" and event.get("isFinalSegment") is False
+        )
+        self.assertLess(audio_index, final_segment_index)
+        self.assertGreater(audio_index, intermediate_segment_index)
 
     async def test_approval_required_tools_resume_the_same_loop_after_approval(self) -> None:
         class ApprovalHost(TestRuntimeHost):

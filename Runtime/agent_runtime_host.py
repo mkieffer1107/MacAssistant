@@ -9,7 +9,6 @@ import io
 import json
 import math
 import os
-import queue
 import re
 import signal
 import shutil
@@ -20,7 +19,7 @@ import threading
 import time
 import uuid
 import wave
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -50,6 +49,7 @@ TTS_PCM_SAMPLE_RATE = 24_000
 TTS_PCM_CHANNELS = 1
 TTS_PCM_ENCODING = "pcm_s16le"
 TTS_STREAM_FRAME_BATCH = 8
+STREAM_REPLY_SPEECH_MAX_CHARS = 180
 
 MODEL_SPECS = {
     "agent_model": {
@@ -85,6 +85,14 @@ NULL_TQDM_STREAM = open(os.devnull, "w", encoding="utf-8")
 def runtime_log(message: str) -> None:
     sys.stderr.write(f"{message}\n")
     sys.stderr.flush()
+
+
+def mlx_wired_limit(model: Any):
+    try:
+        from mlx_audio.stt.generate import wired_limit
+    except Exception:  # noqa: BLE001
+        return nullcontext()
+    return wired_limit(model)
 
 
 class SilentTqdm(base_tqdm):
@@ -183,6 +191,7 @@ class TurnBuffer:
     turn_id: str
     speak_reply: bool
     voice_preset: str
+    stream_reply_speech: bool = True
     attachments: list[dict[str, Any]] = field(default_factory=list)
     pcm_bytes: bytearray = field(default_factory=bytearray)
     stopped: bool = False
@@ -231,6 +240,7 @@ class PendingToolLoopState:
     next_tool_index: int
     speak_reply: bool
     voice_preset: str
+    stream_reply_speech: bool = True
 
 
 @dataclass
@@ -455,6 +465,20 @@ class VoxtralStreamingProcessor:
             is_first_audio_chunk=False,
         )
 
+    def next_required_audio_length(
+        self,
+        *,
+        audio_length: int,
+        finalize: bool,
+    ) -> int | None:
+        if finalize:
+            return None
+        if not self._dispatched_first_chunk:
+            return self.num_samples_first_audio_chunk
+        if self._next_start_sample >= audio_length:
+            return self._next_start_sample + self.num_samples_per_audio_chunk
+        return self._next_start_sample + self.num_samples_per_audio_chunk
+
     def advance(
         self,
         *,
@@ -495,29 +519,25 @@ class VoxtralRealtimeSTTSession(BaseSTTSession):
         self._emit_partial = emit_partial
         self._emit_error = emit_error
         self._transcription_delay_ms = transcription_delay_ms
-        self._min_preview_pcm_bytes = min_preview_pcm_bytes
-        self._preview_poll_interval_s = preview_poll_interval_s
         self._loop = asyncio.get_running_loop()
-        self._audio_queue: queue.Queue[object] = queue.Queue()
-        self._stop_sentinel = object()
         self._model_lock = threading.Lock()
-        self._audio_lock = threading.Lock()
+        self._audio_condition = threading.Condition()
         self._stopped = False
         self._cancelled = False
+        self._worker_failed = False
         self._full_text = ""
         self._current_segment_text = ""
         self._preview_text = ""
         self._last_emitted_text = ""
         self._pcm_bytes = bytearray()
-        self._audio_buffer = np.zeros(0, dtype=np.float32)
         self._final_audio_buffer: np.ndarray | None = None
         self._session_started_at = time.monotonic()
+        self._last_live_partial_at: float | None = None
         self._first_partial_at: float | None = None
         self._eos_reset_count = 0
         self._audio_seconds_ingested = 0.0
-        self._dirty = False
-        self._updated = asyncio.Event()
         self._live_partial_seen = False
+        self._waiting_for_samples: int | None = None
 
         config = model.config
         audio_config = config.audio_encoding_args
@@ -565,7 +585,6 @@ class VoxtralRealtimeSTTSession(BaseSTTSession):
         self._next_token = None
         self._decode_position = self._prefix_len
         self._generated_tokens: list[int] = []
-        self._preview_fallback_after_s = 1.5
 
         self._log_debug(
             "selected stt path=realtime "
@@ -573,41 +592,29 @@ class VoxtralRealtimeSTTSession(BaseSTTSession):
             f"first_chunk_samples={self._streaming_processor.num_samples_first_audio_chunk} "
             f"chunk_samples={self._streaming_processor.num_samples_per_audio_chunk}"
         )
-        with self._model_lock:
-            self._prime_left_pad_prefix()
         self._worker_task = asyncio.create_task(asyncio.to_thread(self._run_worker))
-        self._preview_task = asyncio.create_task(self._preview_loop())
 
     def append_pcm_bytes(self, pcm_bytes: bytes) -> None:
         if self._stopped or self._cancelled or not pcm_bytes:
             return
-        self._pcm_bytes.extend(pcm_bytes)
-        self._audio_seconds_ingested = len(self._pcm_bytes) / 2.0 / self._sample_rate
-        self._dirty = True
-        self._updated.set()
-        audio_chunk = self._pcm_bytes_to_audio_array(pcm_bytes)
-        with self._audio_lock:
-            if self._audio_buffer.size == 0:
-                self._audio_buffer = audio_chunk
-            else:
-                self._audio_buffer = np.concatenate([self._audio_buffer, audio_chunk])
-        self._audio_queue.put(object())
+        with self._audio_condition:
+            self._pcm_bytes.extend(pcm_bytes)
+            self._audio_seconds_ingested = len(self._pcm_bytes) / 2.0 / self._sample_rate
+            self._audio_condition.notify_all()
 
     async def finish(self) -> str:
         if self._stopped:
             return self._final_text()
 
-        self._stopped = True
-        self._audio_queue.put(self._stop_sentinel)
-        self._updated.set()
+        with self._audio_condition:
+            self._stopped = True
+            self._audio_condition.notify_all()
         try:
             await self._worker_task
-            if self._preview_task is not None:
-                await self._preview_task
         except asyncio.CancelledError:
             raise
         final_text = self._final_text()
-        if not final_text and self._pcm_bytes:
+        if (self._worker_failed or not final_text) and self._pcm_bytes:
             try:
                 fallback_text = (
                     await asyncio.to_thread(
@@ -627,79 +634,74 @@ class VoxtralRealtimeSTTSession(BaseSTTSession):
         return final_text
 
     def cancel(self) -> None:
-        self._cancelled = True
-        self._stopped = True
-        self._audio_queue.put(self._stop_sentinel)
-        self._updated.set()
-        if self._worker_task:
-            self._worker_task.cancel()
-        if self._preview_task:
-            self._preview_task.cancel()
+        with self._audio_condition:
+            self._cancelled = True
+            self._stopped = True
+            self._audio_condition.notify_all()
 
     def _run_worker(self) -> None:
         try:
-            while True:
-                try:
-                    item = self._audio_queue.get(timeout=0.02)
-                except queue.Empty:
-                    item = None
+            with mlx_wired_limit(self._model):
+                with self._model_lock:
+                    self._prime_left_pad_prefix()
 
-                if item is self._stop_sentinel:
-                    break
+                while True:
+                    if self._cancelled:
+                        return
+                    with self._model_lock:
+                        self._advance_stream(finalize=False)
+                    if self._cancelled:
+                        return
+                    if self._stopped:
+                        break
+                    self._wait_for_audio_watermark(self._next_required_audio_samples())
 
                 with self._model_lock:
-                    self._advance_stream(finalize=False)
-                if self._cancelled:
-                    return
-
-            with self._model_lock:
-                self._flush_stream()
+                    self._flush_stream()
         except Exception as exc:  # noqa: BLE001
+            self._worker_failed = True
             self._schedule_error(f"Realtime transcription failed: {exc}")
 
-    async def _preview_loop(self) -> None:
-        while not self._stopped:
-            try:
-                await asyncio.wait_for(
-                    self._updated.wait(),
-                    timeout=self._preview_poll_interval_s,
-                )
-            except asyncio.TimeoutError:
-                pass
-            self._updated.clear()
-            if self._live_partial_seen:
+    def _next_required_audio_samples(self) -> int | None:
+        with self._audio_condition:
+            audio_length = len(self._pcm_bytes) // 2
+        return self._streaming_processor.next_required_audio_length(
+            audio_length=audio_length,
+            finalize=False,
+        )
+
+    def _wait_for_audio_watermark(self, required_samples: int | None) -> None:
+        if required_samples is None:
+            return
+        with self._audio_condition:
+            current_samples = len(self._pcm_bytes) // 2
+            if current_samples >= required_samples or self._stopped or self._cancelled:
                 return
-            if time.monotonic() - self._session_started_at < self._preview_fallback_after_s:
-                continue
-            if not self._dirty or len(self._pcm_bytes) < self._min_preview_pcm_bytes:
-                continue
-
-            snapshot = bytes(self._pcm_bytes)
-            self._dirty = False
-            try:
-                preview_text = (
-                    await asyncio.to_thread(
-                        self._transcribe_snapshot,
-                        snapshot,
-                        PREVIEW_TRANSCRIPTION_DELAY_MS,
+            self._waiting_for_samples = required_samples
+            self._log_debug(
+                f"waiting for audio available_samples={current_samples} "
+                f"required_samples={required_samples}"
+            )
+            while True:
+                self._audio_condition.wait()
+                if self._cancelled or self._stopped:
+                    self._waiting_for_samples = None
+                    return
+                current_samples = len(self._pcm_bytes) // 2
+                if current_samples >= required_samples:
+                    self._log_debug(
+                        f"resumed live decode available_samples={current_samples} "
+                        f"required_samples={required_samples}"
                     )
-                ).strip()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                self._emit_error(f"Realtime preview fallback failed: {exc}")
-                continue
-
-            if preview_text:
-                self._update_preview_text(preview_text)
+                    self._waiting_for_samples = None
+                    return
 
     def _flush_stream(self) -> None:
         if self._cancelled:
             return
 
         if self._final_audio_buffer is None:
-            with self._audio_lock:
-                final_audio = self._audio_buffer.copy()
+            final_audio = self._pcm_bytes_to_audio_array(bytes(self._pcm_bytes))
             right_pad = np.zeros(
                 self._n_right_pad_tokens * self._samples_per_token,
                 dtype=np.float32,
@@ -750,24 +752,27 @@ class VoxtralRealtimeSTTSession(BaseSTTSession):
         self._mx.eval(self._audio_embed_buffer)
 
     def _next_streaming_mel_chunk(self, *, finalize: bool) -> Any | None:
-        audio_source = self._final_audio_buffer if finalize else self._audio_buffer
-        if audio_source is None:
-            return None
-
-        if finalize:
-            source = audio_source
-        else:
-            with self._audio_lock:
-                source = self._audio_buffer
+        audio_length = (
+            int(self._final_audio_buffer.shape[0])
+            if finalize and self._final_audio_buffer is not None
+            else len(self._pcm_bytes) // 2
+        )
 
         chunk = self._streaming_processor.next_chunk(
-            audio_length=int(source.shape[0]),
+            audio_length=audio_length,
             finalize=finalize,
         )
         if chunk is None:
             return None
 
-        audio_chunk = source[chunk.start_sample : chunk.end_sample].copy()
+        if finalize:
+            if self._final_audio_buffer is None:
+                return None
+            audio_chunk = self._final_audio_buffer[
+                chunk.start_sample : chunk.end_sample
+            ].copy()
+        else:
+            audio_chunk = self._audio_slice(chunk.start_sample, chunk.end_sample)
         mel = self._compute_streaming_mel_spectrogram(
             audio_chunk,
             is_first_audio_chunk=chunk.is_first_audio_chunk,
@@ -949,25 +954,27 @@ class VoxtralRealtimeSTTSession(BaseSTTSession):
             self._encoder_position = 0
 
     def _emit_cumulative_text(self, *, force: bool = False) -> None:
-        combined = self._final_text()
-        if (force or combined != self._last_emitted_text) and combined:
-            self._last_emitted_text = combined
-            self._live_partial_seen = True
-            if self._first_partial_at is None:
-                self._first_partial_at = time.monotonic()
-                self._log_debug(
-                    "first partial "
-                    f"latency_s={self._first_partial_latency():.2f} "
-                    f"audio_s={self._audio_seconds_ingested:.2f}"
-                )
-            self._schedule_partial(combined)
+        live_text = self._live_text()
+        if not live_text:
+            return
+
+        now = time.monotonic()
+        self._live_partial_seen = True
+        self._last_live_partial_at = now
+        if self._first_partial_at is None:
+            self._first_partial_at = now
+            self._log_debug(
+                "first partial "
+                f"latency_s={self._first_partial_latency():.2f} "
+                f"audio_s={self._audio_seconds_ingested:.2f}"
+            )
+
+        if force or live_text != self._last_emitted_text:
+            self._last_emitted_text = live_text
+            self._schedule_partial(live_text)
 
     def _final_text(self) -> str:
-        live_parts = [self._full_text.strip(), self._current_segment_text.strip()]
-        live_text = " ".join(part for part in live_parts if part).strip()
-        if self._live_partial_seen and live_text:
-            return live_text
-        return max((live_text, self._preview_text.strip()), key=len).strip()
+        return self._live_text() or self._preview_text.strip()
 
     def _schedule_partial(self, text: str) -> None:
         self._loop.call_soon_threadsafe(self._emit_partial, text)
@@ -983,22 +990,16 @@ class VoxtralRealtimeSTTSession(BaseSTTSession):
     def _log_debug(self, message: str) -> None:
         runtime_log(f"[stt:{self.turn_id}] {message}")
 
-    def _update_preview_text(self, text: str) -> None:
-        if self._live_partial_seen or not text:
-            return
-        if len(text) < len(self._preview_text):
-            return
-        self._preview_text = text
-        if self._first_partial_at is None:
-            self._first_partial_at = time.monotonic()
-            self._log_debug(
-                "first partial via preview "
-                f"latency_s={self._first_partial_latency():.2f} "
-                f"audio_s={self._audio_seconds_ingested:.2f}"
-            )
-        if text != self._last_emitted_text:
-            self._last_emitted_text = text
-            self._schedule_partial(text)
+    def _live_text(self) -> str:
+        live_parts = [self._full_text.strip(), self._current_segment_text.strip()]
+        return " ".join(part for part in live_parts if part).strip()
+
+    def _audio_slice(self, start_sample: int, end_sample: int) -> np.ndarray:
+        start_byte = max(start_sample, 0) * 2
+        end_byte = max(end_sample, start_sample) * 2
+        with self._audio_condition:
+            snapshot = bytes(self._pcm_bytes[start_byte:end_byte])
+        return self._pcm_bytes_to_audio_array(snapshot)
 
     def _transcribe_snapshot(self, pcm_bytes: bytes, transcription_delay_ms: int) -> str:
         audio_array = self._pcm_bytes_to_audio_array(pcm_bytes)
@@ -1388,18 +1389,22 @@ class RuntimeHost:
             turn_id = command["turnID"]
             attachments = self.normalize_attachments(command.get("attachments"))
             speak_reply = bool(command.get("speakReply"))
-            voice_preset = (command.get("arguments") or {}).get(
-                "voice_preset",
-                "casual_male",
+            arguments = command.get("arguments") or {}
+            voice_preset = arguments.get("voice_preset", "casual_male")
+            stream_reply_speech = self.command_boolean_argument(
+                arguments,
+                "stream_reply_speech",
+                default=True,
             )
             self.start_turn_task(
                 turn_id,
-                lambda turn_id=turn_id, attachments=attachments, speak_reply=speak_reply, voice_preset=voice_preset: self.run_turn(
+                lambda turn_id=turn_id, attachments=attachments, speak_reply=speak_reply, voice_preset=voice_preset, stream_reply_speech=stream_reply_speech: self.run_turn(
                     turn_id=turn_id,
                     user_text=command.get("text", ""),
                     attachments=attachments,
                     speak_reply=speak_reply,
                     voice_preset=voice_preset,
+                    stream_reply_speech=stream_reply_speech,
                 ),
             )
         elif command_type == "speak_text":
@@ -1663,6 +1668,11 @@ class RuntimeHost:
             turn_id=turn_id,
             speak_reply=bool(command.get("speakReply")),
             voice_preset=str(arguments.get("voice_preset", "casual_male")),
+            stream_reply_speech=self.command_boolean_argument(
+                arguments,
+                "stream_reply_speech",
+                default=True,
+            ),
             attachments=self.normalize_attachments(command.get("attachments")),
         )
         buffer.stt_session = self.create_stt_session(turn_id)
@@ -1700,6 +1710,7 @@ class RuntimeHost:
                 attachments=buffer.attachments,
                 speak_reply=buffer.speak_reply,
                 voice_preset=buffer.voice_preset,
+                stream_reply_speech=buffer.stream_reply_speech,
             )
         finally:
             self.turns.pop(turn_id, None)
@@ -1723,6 +1734,7 @@ class RuntimeHost:
         attachments: list[dict[str, Any]] | None,
         speak_reply: bool,
         voice_preset: str,
+        stream_reply_speech: bool = True,
     ) -> None:
         attachments = self.normalize_attachments(attachments)
         resolved_user_text = user_text.strip()
@@ -1754,6 +1766,7 @@ class RuntimeHost:
                 next_tool_index=0,
                 speak_reply=speak_reply,
                 voice_preset=voice_preset,
+                stream_reply_speech=stream_reply_speech,
             )
         )
 
@@ -1807,12 +1820,21 @@ class RuntimeHost:
                 continue
 
             if segment_id is not None:
-                await self.stream_assistant_text(
-                    turn_id,
-                    step.text,
-                    assistant_segment_id=segment_id,
-                    is_final_segment=True,
-                )
+                if loop_state.speak_reply and loop_state.stream_reply_speech:
+                    await self.stream_assistant_text_with_buffered_speech(
+                        turn_id,
+                        step.text,
+                        assistant_segment_id=segment_id,
+                        is_final_segment=True,
+                        voice_preset=loop_state.voice_preset,
+                    )
+                else:
+                    await self.stream_assistant_text(
+                        turn_id,
+                        step.text,
+                        assistant_segment_id=segment_id,
+                        is_final_segment=True,
+                    )
 
             if not step.text:
                 raise RuntimeError(
@@ -1831,7 +1853,7 @@ class RuntimeHost:
                     {"role": "assistant", "content": step.text},
                 ]
             )
-            if loop_state.speak_reply:
+            if loop_state.speak_reply and not loop_state.stream_reply_speech:
                 await self.speak(turn_id, step.text, loop_state.voice_preset)
             self.raise_if_turn_cancelled(turn_id)
             self.emit_turn_finished(turn_id, status="finished", is_final=True)
@@ -2230,11 +2252,58 @@ class RuntimeHost:
             self.emit(payload)
             await asyncio.sleep(0.025)
 
+    async def stream_assistant_text_with_buffered_speech(
+        self,
+        turn_id: str,
+        text: str,
+        *,
+        assistant_segment_id: str | None,
+        is_final_segment: bool | None,
+        voice_preset: str,
+    ) -> None:
+        stream_task = asyncio.create_task(
+            self.stream_assistant_text(
+                turn_id,
+                text,
+                assistant_segment_id=assistant_segment_id,
+                is_final_segment=is_final_segment,
+            )
+        )
+        speech_task = asyncio.create_task(
+            self.speak_buffered_reply(turn_id, text, voice_preset)
+        )
+        try:
+            await asyncio.gather(stream_task, speech_task)
+        except Exception:
+            for task in (stream_task, speech_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(stream_task, speech_task, return_exceptions=True)
+            raise
+
+    async def speak_buffered_reply(
+        self,
+        turn_id: str,
+        text: str,
+        voice_preset: str,
+    ) -> None:
+        segments = self.buffered_reply_speech_segments(text)
+        if not segments:
+            return
+        await self.warm_model("tts_model", {})
+        self.require_model("tts_model", self.tts_model)
+        for segment in segments:
+            self.raise_if_turn_cancelled(turn_id)
+            await self.emit_tts_audio(turn_id, segment, voice_preset)
+
     async def speak(self, turn_id: str, text: str, voice_preset: str) -> None:
         if not text.strip():
             return
         await self.warm_model("tts_model", {})
         self.require_model("tts_model", self.tts_model)
+        await self.emit_tts_audio(turn_id, text, voice_preset)
+
+    async def emit_tts_audio(self, turn_id: str, text: str, voice_preset: str) -> None:
         cancel_event = self.turn_cancel_event(turn_id)
         queue_items: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
         loop = asyncio.get_running_loop()
@@ -2282,6 +2351,58 @@ class RuntimeHost:
             if cancel_event is not None:
                 cancel_event.set()
             raise
+
+    @staticmethod
+    def buffered_reply_speech_segments(
+        text: str,
+        *,
+        max_chars: int = STREAM_REPLY_SPEECH_MAX_CHARS,
+    ) -> list[str]:
+        segments: list[str] = []
+        buffer = ""
+
+        def flush() -> None:
+            nonlocal buffer
+            segment = buffer.strip()
+            if segment:
+                segments.append(segment)
+            buffer = ""
+
+        for chunk in RuntimeHost.assistant_stream_chunks(text):
+            buffer += chunk
+            stripped = buffer.rstrip()
+            if not stripped:
+                continue
+            if stripped[-1] in ".!?":
+                flush()
+                continue
+            if len(stripped) >= max_chars and (
+                chunk.isspace() or stripped[-1] in ",;:"
+            ):
+                flush()
+
+        flush()
+        return segments
+
+    @staticmethod
+    def command_boolean_argument(
+        arguments: dict[str, Any],
+        key: str,
+        *,
+        default: bool,
+    ) -> bool:
+        value = arguments.get(key)
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+        return bool(value)
 
     def iter_tts_pcm_chunks(
         self,

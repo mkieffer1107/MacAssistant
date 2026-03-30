@@ -1010,6 +1010,7 @@ struct MacAssistantTests {
         firstModel.settings.inputDevicePreference = .specificDeviceUID("built-in-mic")
         firstModel.settings.launchOnOpen = true
         firstModel.settings.alwaysAcceptToolCalls = true
+        firstModel.settings.streamReplySpeechWhileGenerating = false
 
         let secondModel = AppModel(appSupportURL: tempDirectory, persistSettings: true)
 
@@ -1017,6 +1018,15 @@ struct MacAssistantTests {
         #expect(secondModel.settings.inputDevicePreference == .specificDeviceUID("built-in-mic"))
         #expect(secondModel.settings.launchOnOpen)
         #expect(secondModel.settings.alwaysAcceptToolCalls)
+        #expect(secondModel.settings.streamReplySpeechWhileGenerating == false)
+    }
+
+    @Test
+    @MainActor
+    func settingsDefaultToStreamingSpokenReplies() {
+        let model = AppModel()
+
+        #expect(model.settings.streamReplySpeechWhileGenerating)
     }
 
     @Test
@@ -1196,7 +1206,10 @@ struct MacAssistantTests {
         #expect(currentVoiceDraft(in: model) != nil)
         #expect(model.isRecording)
         #expect(model.isWaitingForMicrophoneAudio)
+        #expect(model.voiceRecordingDisplayPhase == .waitingForAudio)
+        #expect(model.isVoiceDraftLoading)
         #expect(model.statusText == "Waiting for microphone audio…")
+        #expect(model.voiceRecordingHelperText == "Waiting for microphone audio. Press send to finish, or stop to discard the draft.")
         #expect(systemStatuses(in: model).isEmpty)
         #expect(runtime.sentCommands.isEmpty)
     }
@@ -1222,7 +1235,9 @@ struct MacAssistantTests {
         await settleVoiceCallbacks()
 
         #expect(model.isWaitingForMicrophoneAudio == false)
-        #expect(model.statusText == "Listening…")
+        #expect(model.isVoiceTranscriptionStarting)
+        #expect(model.isVoiceDraftLoading)
+        #expect(model.statusText == "Starting transcription…")
         #expect(runtime.sentCommands.isEmpty)
 
         microphoneService.emitChunk()
@@ -1230,6 +1245,39 @@ struct MacAssistantTests {
 
         #expect(runtime.sentCommands.map(\.type) == ["start_recording", "append_audio_chunk"])
         #expect(model.lastRuntimeCommand?.type == "append_audio_chunk")
+    }
+
+    @Test
+    @MainActor
+    func recordingStartupStaysLoadingUntilFirstTranscriptDeltaArrives() async throws {
+        let microphoneService = FakeMicrophoneCaptureService()
+        let runtime = FakeRuntimeClient()
+        let model = AppModel(runtime: runtime, microphoneService: microphoneService)
+        model.isMicReady = true
+
+        model.startRecording()
+        await settleVoiceCallbacks()
+
+        #expect(model.voiceRecordingDisplayPhase == .startingTranscription)
+        #expect(model.isVoiceDraftLoading)
+        #expect(model.voiceDraftLoadingLabel == "Starting transcription")
+        #expect(model.voiceRecordingHelperText == "Starting transcription. Keep speaking and MacAssistant will switch to live text as soon as the first words arrive.")
+        #expect(model.statusText == "Starting transcription…")
+
+        let turnID = try #require(currentVoiceDraft(in: model)?.turnID)
+        microphoneService.emitChunk()
+        await settleVoiceCallbacks()
+
+        #expect(model.hasReceivedVoiceTranscript == false)
+        #expect(model.voiceRecordingDisplayPhase == .startingTranscription)
+
+        model.handle(event: runtimeEvent(type: "transcript_delta", turnID: turnID, text: "Hello"))
+
+        #expect(model.hasReceivedVoiceTranscript)
+        #expect(model.isVoiceDraftLoading == false)
+        #expect(model.voiceRecordingDisplayPhase == .transcribing)
+        #expect(model.voiceRecordingHelperText == "Listening for speech. Press send to use it, or stop to discard it.")
+        #expect(model.statusText == "Listening…")
     }
 
     @Test
@@ -1250,6 +1298,8 @@ struct MacAssistantTests {
         model.handle(event: runtimeEvent(type: "transcript_delta", turnID: turnID, text: "Hello there"))
 
         #expect(currentVoiceDraft(in: model)?.text == "Hello there")
+        #expect(model.hasReceivedVoiceTranscript)
+        #expect(model.voiceRecordingDisplayPhase == .transcribing)
         #expect(model.lastRuntimeCommand?.type == "append_audio_chunk")
         #expect(model.lastRuntimeCommand?.turnID == turnID)
     }
@@ -1406,6 +1456,39 @@ struct MacAssistantTests {
         #expect(message.source == .voice)
         #expect(model.lastRuntimeCommand?.type == "send_text")
         #expect(model.lastRuntimeCommand?.attachments?.first?.filePath == imageURL.path)
+        #expect(model.lastRuntimeCommand?.arguments?["stream_reply_speech"] == .bool(true))
+    }
+
+    @Test
+    @MainActor
+    func sendTextCommandIncludesStreamReplySpeechSetting() {
+        let runtime = FakeRuntimeClient()
+        let model = AppModel(runtime: runtime)
+        model.settings.streamReplySpeechWhileGenerating = false
+        model.composerText = "Hello"
+
+        model.sendTextMessage()
+
+        #expect(model.lastRuntimeCommand?.type == "send_text")
+        #expect(model.lastRuntimeCommand?.arguments?["stream_reply_speech"] == .bool(false))
+    }
+
+    @Test
+    @MainActor
+    func startRecordingCommandIncludesStreamReplySpeechSetting() async throws {
+        let microphoneService = FakeMicrophoneCaptureService()
+        let runtime = FakeRuntimeClient()
+        let model = AppModel(runtime: runtime, microphoneService: microphoneService)
+        model.settings.streamReplySpeechWhileGenerating = false
+        model.isMicReady = true
+
+        model.startRecording()
+        await settleVoiceCallbacks()
+        microphoneService.emitChunk()
+        await settleVoiceCallbacks()
+
+        let startCommand = try #require(runtime.sentCommands.first(where: { $0.type == "start_recording" }))
+        #expect(startCommand.arguments?["stream_reply_speech"] == .bool(false))
     }
 
     @Test
@@ -1500,7 +1583,7 @@ struct MacAssistantTests {
         #expect(currentVoiceDraft(in: model)?.turnID == turnID)
         #expect(model.isRecording)
         #expect(systemStatuses(in: model).isEmpty)
-        #expect(model.statusText == "Listening…")
+        #expect(model.statusText == "Starting transcription…")
     }
 
     @Test

@@ -28,6 +28,14 @@ final class AppModel {
         case playing
     }
 
+    enum VoiceRecordingDisplayPhase: Equatable {
+        case idle
+        case startingTranscription
+        case waitingForAudio
+        case transcribing
+        case finalizing
+    }
+
     private struct VoiceRecordingState {
         enum Phase {
             case capturing
@@ -41,6 +49,7 @@ final class AppModel {
         var runtimeStarted = false
         var captureStartRetryCount = 0
         var hasObservedInputBuffer = false
+        var hasReceivedTranscriptDelta = false
         var isWaitingForAudio = false
         var capturedChunkCount = 0
         var bufferedChunks: [MicrophoneCaptureService.CaptureChunk] = []
@@ -57,6 +66,7 @@ final class AppModel {
             case inputDevicePreference
             case launchOnOpen
             case alwaysAcceptToolCalls
+            case streamReplySpeechWhileGenerating
         }
 
         enum InputDevicePreference: Codable, Sendable, Equatable {
@@ -101,17 +111,20 @@ final class AppModel {
         var inputDevicePreference: InputDevicePreference
         var launchOnOpen: Bool
         var alwaysAcceptToolCalls: Bool
+        var streamReplySpeechWhileGenerating: Bool
 
         init(
             defaultVoicePreset: String = "casual_male",
             inputDevicePreference: InputDevicePreference = .automatic,
             launchOnOpen: Bool = false,
-            alwaysAcceptToolCalls: Bool = false
+            alwaysAcceptToolCalls: Bool = false,
+            streamReplySpeechWhileGenerating: Bool = true
         ) {
             self.defaultVoicePreset = defaultVoicePreset
             self.inputDevicePreference = inputDevicePreference
             self.launchOnOpen = launchOnOpen
             self.alwaysAcceptToolCalls = alwaysAcceptToolCalls
+            self.streamReplySpeechWhileGenerating = streamReplySpeechWhileGenerating
         }
 
         init(from decoder: Decoder) throws {
@@ -120,6 +133,7 @@ final class AppModel {
             self.inputDevicePreference = try container.decodeIfPresent(InputDevicePreference.self, forKey: .inputDevicePreference) ?? .automatic
             self.launchOnOpen = try container.decodeIfPresent(Bool.self, forKey: .launchOnOpen) ?? false
             self.alwaysAcceptToolCalls = try container.decodeIfPresent(Bool.self, forKey: .alwaysAcceptToolCalls) ?? false
+            self.streamReplySpeechWhileGenerating = try container.decodeIfPresent(Bool.self, forKey: .streamReplySpeechWhileGenerating) ?? true
         }
 
         func encode(to encoder: Encoder) throws {
@@ -128,6 +142,7 @@ final class AppModel {
             try container.encode(inputDevicePreference, forKey: .inputDevicePreference)
             try container.encode(launchOnOpen, forKey: .launchOnOpen)
             try container.encode(alwaysAcceptToolCalls, forKey: .alwaysAcceptToolCalls)
+            try container.encode(streamReplySpeechWhileGenerating, forKey: .streamReplySpeechWhileGenerating)
         }
     }
 
@@ -238,6 +253,65 @@ final class AppModel {
         voiceRecordingState?.isWaitingForAudio == true
     }
 
+    var hasReceivedVoiceTranscript: Bool {
+        voiceRecordingState?.hasReceivedTranscriptDelta == true
+    }
+
+    var voiceRecordingDisplayPhase: VoiceRecordingDisplayPhase {
+        guard let state = voiceRecordingState else { return .idle }
+        switch state.phase {
+        case .finalizing:
+            return .finalizing
+        case .capturing:
+            if state.isWaitingForAudio {
+                return .waitingForAudio
+            }
+            if state.hasReceivedTranscriptDelta {
+                return .transcribing
+            }
+            return .startingTranscription
+        }
+    }
+
+    var isVoiceTranscriptionStarting: Bool {
+        voiceRecordingDisplayPhase == .startingTranscription
+    }
+
+    var isVoiceDraftLoading: Bool {
+        switch voiceRecordingDisplayPhase {
+        case .startingTranscription, .waitingForAudio:
+            return true
+        case .idle, .transcribing, .finalizing:
+            return false
+        }
+    }
+
+    var voiceDraftLoadingLabel: String {
+        switch voiceRecordingDisplayPhase {
+        case .waitingForAudio:
+            return "Waiting for audio"
+        case .finalizing:
+            return "Finalizing speech"
+        case .idle, .startingTranscription, .transcribing:
+            return "Starting transcription"
+        }
+    }
+
+    var voiceRecordingHelperText: String {
+        switch voiceRecordingDisplayPhase {
+        case .waitingForAudio:
+            return "Waiting for microphone audio. Press send to finish, or stop to discard the draft."
+        case .startingTranscription:
+            return "Starting transcription. Keep speaking and MacAssistant will switch to live text as soon as the first words arrive."
+        case .transcribing:
+            return "Listening for speech. Press send to use it, or stop to discard it."
+        case .finalizing:
+            return "Finalizing speech. The live transcript will submit as soon as the last chunk is processed."
+        case .idle:
+            return "Press Return to send, or use the mic for a spoken request."
+        }
+    }
+
     var isReplySpeechActive: Bool {
         activeReplySpeechTurnID != nil
     }
@@ -266,6 +340,21 @@ final class AppModel {
     var unavailableSelectedInputDeviceUID: String? {
         guard case .specificDeviceUID(let uid) = settings.inputDevicePreference else { return nil }
         return availableInputDevices.contains(where: { $0.uid == uid }) ? nil : uid
+    }
+
+    private var voiceRecordingStatusSummary: String {
+        switch voiceRecordingDisplayPhase {
+        case .waitingForAudio:
+            return "Waiting for microphone audio…"
+        case .startingTranscription:
+            return "Starting transcription…"
+        case .transcribing:
+            return "Listening…"
+        case .finalizing:
+            return "Finalizing speech…"
+        case .idle:
+            return "Ready"
+        }
     }
 
     private var activeTurnIDs = Set<String>()
@@ -948,13 +1037,13 @@ final class AppModel {
         voiceDraftIDsByTurn[turnID] = conversation.count - 1
         noteConversationChanged()
         pendingComposerImage = nil
-        statusText = "Listening…"
+        statusText = voiceRecordingStatusSummary
         startMicrophoneCapture(for: turnID, isRetry: false)
     }
 
     private func handleMicrophoneCaptureStarted(turnID: String) {
         guard voiceRecordingState?.turnID == turnID else { return }
-        statusText = "Listening…"
+        statusText = voiceRecordingStatusSummary
     }
 
     private func handleMicrophoneInputBuffer(turnID: String) {
@@ -973,7 +1062,7 @@ final class AppModel {
         voiceRecordingState = state
         cancelVoiceCaptureWaitingTask()
         if wasWaiting {
-            statusText = "Listening…"
+            statusText = voiceRecordingStatusSummary
         }
     }
 
@@ -1030,7 +1119,7 @@ final class AppModel {
             channels: nil,
             toolCallID: nil,
             attachments: runtimeAttachments(from: state.imageAttachment),
-            arguments: ["voice_preset": .string(settings.defaultVoicePreset)]
+            arguments: runtimeSpeechArguments()
         ))
 
         activeTurnIDs.insert(turnID)
@@ -1067,8 +1156,18 @@ final class AppModel {
 
         state.isWaitingForAudio = true
         voiceRecordingState = state
-        statusText = "Waiting for microphone audio…"
+        statusText = voiceRecordingStatusSummary
         appendRuntimeLog("[Mic] Waiting for microphone audio after \(Self.describe(duration: voiceCaptureWaitingDelay)) without input.")
+    }
+
+    private func noteVoiceTranscriptDelta(turnID: String) {
+        guard var state = voiceRecordingState, state.turnID == turnID else { return }
+        state.hasReceivedTranscriptDelta = true
+        state.isWaitingForAudio = false
+        voiceRecordingState = state
+        if state.phase == .capturing {
+            statusText = voiceRecordingStatusSummary
+        }
     }
 
     private func resolvedPreferredInputDevice() -> MicrophoneCaptureService.InputDevice? {
@@ -1572,6 +1671,7 @@ final class AppModel {
             handleDownloadProgress(event)
         case "transcript_delta":
             guard let turnID = event.turnID, !discardedTurnIDs.contains(turnID) else { return }
+            noteVoiceTranscriptDelta(turnID: turnID)
             updateVoiceDraft(turnID: turnID, text: event.text ?? "")
         case "transcript_final":
             guard let turnID = event.turnID, !discardedTurnIDs.contains(turnID) else { return }
@@ -2502,8 +2602,15 @@ final class AppModel {
             text: text,
             speakReply: speakReply,
             attachments: runtimeAttachments(from: imageAttachment),
-            arguments: ["voice_preset": .string(settings.defaultVoicePreset)]
+            arguments: runtimeSpeechArguments()
         ))
+    }
+
+    private func runtimeSpeechArguments() -> [String: JSONValue] {
+        [
+            "voice_preset": .string(settings.defaultVoicePreset),
+            "stream_reply_speech": .bool(settings.streamReplySpeechWhileGenerating),
+        ]
     }
 
     private func cancelActiveSpeechPlaybackIfNeeded() {

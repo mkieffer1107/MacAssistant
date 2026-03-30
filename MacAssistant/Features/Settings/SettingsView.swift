@@ -40,6 +40,13 @@ struct SettingsView: View {
         )
     }
 
+    private var streamReplySpeechSelection: Binding<Bool> {
+        Binding(
+            get: { model.settings.streamReplySpeechWhileGenerating },
+            set: { model.settings.streamReplySpeechWhileGenerating = $0 }
+        )
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -128,6 +135,17 @@ struct SettingsView: View {
                 subtitle: "Skip approval prompts when the runtime proposes a tool call."
             ) {
                 Toggle("", isOn: alwaysAcceptToolCallsSelection)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Stream spoken replies",
+                subtitle: "Start speaking before the full reply finishes generating."
+            ) {
+                Toggle("", isOn: streamReplySpeechSelection)
                     .labelsHidden()
                     .toggleStyle(.switch)
             }
