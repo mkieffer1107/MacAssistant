@@ -23,6 +23,55 @@ jobs:
       - name: Install xcodegen
         run: brew install xcodegen
 
+      - name: Select and verify Xcode 16+
+        id: xcode_setup
+        run: |
+          set -euo pipefail
+
+          candidates=()
+          for app in /Applications/Xcode*.app; do
+            if [ ! -d "$app" ]; then
+              continue
+            fi
+
+            version=$(/usr/libexec/PlistBuddy -c 'Print:CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || true)
+            [ -n "$version" ] || continue
+
+            major="${version%%.*}"
+            if [ "$major" -lt 16 ]; then
+              continue
+            fi
+
+            candidates+=("$version|$app")
+          done
+
+          if [ "${#candidates[@]}" -eq 0 ]; then
+            echo "No Xcode installation with major version 16+ found."
+            echo "Installed Xcode apps:"
+            ls -d /Applications/Xcode*.app 2>/dev/null || echo "None"
+            exit 1
+          fi
+
+          best=$(printf '%s\n' "${candidates[@]}" | sort -t'|' -k1,1V | tail -n 1)
+          selected_version="${best%%|*}"
+          selected_app="${best#*|}"
+
+          echo "Using Xcode ${selected_version} at ${selected_app}"
+          echo "DEVELOPER_DIR=${selected_app}/Contents/Developer" >> "$GITHUB_ENV"
+          echo "selected_xcode_version=$selected_version" >> "$GITHUB_OUTPUT"
+          echo "selected_xcode_app=$selected_app" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Xcode compatibility
+        run: |
+          set -euo pipefail
+          xcode_version="$(xcodebuild -version | awk 'NR==1 { print $2 }')"
+          major="${xcode_version%%.*}"
+          if [ "$major" -lt 16 ]; then
+            echo "xcodebuild reported version ${xcode_version}, but format 77 requires Xcode 16+."
+            exit 1
+          fi
+          echo "Using Xcode ${xcode_version}"
+
       - name: Build release artifacts
         id: build
         run: |
